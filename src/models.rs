@@ -17,4 +17,11 @@ pub struct AppUsageData {
     pub claude_code: Option<UsageData>,
     pub codex: Option<UsageData>,
     pub antigravity: Option<UsageData>,
+    pub grok: Option<UsageData>,
+    pub cursor: Option<UsageData>,
+    pub claude_code_auth_required: bool,
+    pub codex_auth_required: bool,
+    pub antigravity_auth_required: bool,
+    pub grok_auth_required: bool,
+    pub cursor_auth_required: bool,
 }

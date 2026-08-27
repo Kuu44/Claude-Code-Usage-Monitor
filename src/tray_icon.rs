@@ -8,11 +8,13 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::native_interop::{self, Color, WM_APP_TRAY};
+use crate::native_interop::{self, Color, Provider, ProviderColorRole, WM_APP_TRAY};
 
 const CLAUDE_TRAY_ICON_ID: u32 = 1;
 const CODEX_TRAY_ICON_ID: u32 = 2;
 const ANTIGRAVITY_TRAY_ICON_ID: u32 = 3;
+const GROK_TRAY_ICON_ID: u32 = 4;
+const CURSOR_TRAY_ICON_ID: u32 = 5;
 
 /// Menu item ID for toggling widget visibility (used by window.rs context menu).
 pub const IDM_TOGGLE_WIDGET: u16 = 70;
@@ -29,6 +31,8 @@ pub enum TrayIconKind {
     Claude,
     Codex,
     Antigravity,
+    Grok,
+    Cursor,
 }
 
 pub struct TrayIconData {
@@ -43,7 +47,19 @@ impl TrayIconKind {
             Self::Claude => CLAUDE_TRAY_ICON_ID,
             Self::Codex => CODEX_TRAY_ICON_ID,
             Self::Antigravity => ANTIGRAVITY_TRAY_ICON_ID,
+            Self::Grok => GROK_TRAY_ICON_ID,
+            Self::Cursor => CURSOR_TRAY_ICON_ID,
         }
+    }
+}
+
+fn provider_for_kind(kind: TrayIconKind) -> Provider {
+    match kind {
+        TrayIconKind::Claude => Provider::Claude,
+        TrayIconKind::Codex => Provider::Codex,
+        TrayIconKind::Antigravity => Provider::Antigravity,
+        TrayIconKind::Grok => Provider::Grok,
+        TrayIconKind::Cursor => Provider::Cursor,
     }
 }
 
@@ -61,11 +77,18 @@ fn lerp_color(start: Color, end: Color, t: f64) -> Color {
 
 fn interpolated_fill(percent: f64) -> Color {
     if percent <= 50.0 {
-        return Color::from_hex("#D97757");
+        return native_interop::provider_color(
+            Provider::Claude,
+            ProviderColorRole::TrayFill,
+            false,
+        );
     }
 
     let stops = [
-        (50.0, Color::from_hex("#D97757")),
+        (
+            50.0,
+            native_interop::provider_color(Provider::Claude, ProviderColorRole::TrayFill, false),
+        ),
         (70.0, Color::from_hex("#D08540")),
         (85.0, Color::from_hex("#CC8C20")),
         (95.0, Color::from_hex("#C45020")),
@@ -85,25 +108,9 @@ fn interpolated_fill(percent: f64) -> Color {
     stops[stops.len() - 1].1
 }
 
-fn codex_fill(percent: f64) -> Color {
-    if percent >= 90.0 {
-        Color::from_hex("#FFFFFF")
-    } else {
-        Color::from_hex("#111111")
-    }
-}
-
-fn antigravity_fill(percent: f64) -> Color {
-    if percent >= 90.0 {
-        Color::from_hex("#FFFFFF")
-    } else {
-        Color::from_hex("#4285F4")
-    }
-}
-
 /// Create a rounded-rectangle tray icon badge showing the usage percentage.
 /// For Claude, `percent` = None uses the embedded app icon as the loading state.
-/// For Codex and Antigravity, `percent` = None uses a provider placeholder badge.
+/// For non-Claude providers, `percent` = None uses a provider placeholder badge.
 pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
     if matches!(kind, TrayIconKind::Claude) && percent.is_none() {
         let app_icon = load_embedded_app_icon();
@@ -115,7 +122,10 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
     let size = 64_i32;
     let margin = 0_i32;
     let radius = 2_i32;
-    let outline = if matches!(kind, TrayIconKind::Codex | TrayIconKind::Antigravity) {
+    let outline = if matches!(
+        kind,
+        TrayIconKind::Codex | TrayIconKind::Antigravity | TrayIconKind::Grok | TrayIconKind::Cursor
+    ) {
         3_i32
     } else {
         0_i32
@@ -123,22 +133,96 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
 
     let fill = match kind {
         TrayIconKind::Claude => interpolated_fill(percent.unwrap_or(0.0)),
-        TrayIconKind::Codex => codex_fill(percent.unwrap_or(0.0)),
-        TrayIconKind::Antigravity => antigravity_fill(percent.unwrap_or(0.0)),
+        _ if percent.unwrap_or(0.0) >= 90.0 => native_interop::provider_color(
+            provider_for_kind(kind),
+            ProviderColorRole::TrayHighUsageFill,
+            false,
+        ),
+        _ => native_interop::provider_color(
+            provider_for_kind(kind),
+            ProviderColorRole::TrayFill,
+            false,
+        ),
     };
     let text_col = match kind {
-        TrayIconKind::Claude => Color::from_hex("#FFFFFF"),
-        TrayIconKind::Codex if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#111111"),
-        TrayIconKind::Codex => Color::from_hex("#FFFFFF"),
-        TrayIconKind::Antigravity if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#1967D2"),
-        TrayIconKind::Antigravity => Color::from_hex("#FFFFFF"),
+        TrayIconKind::Claude => {
+            native_interop::provider_color(Provider::Claude, ProviderColorRole::TrayText, false)
+        }
+        TrayIconKind::Codex if percent.unwrap_or(0.0) >= 90.0 => native_interop::provider_color(
+            Provider::Codex,
+            ProviderColorRole::TrayHighUsageText,
+            false,
+        ),
+        TrayIconKind::Codex => {
+            native_interop::provider_color(Provider::Codex, ProviderColorRole::TrayText, false)
+        }
+        TrayIconKind::Antigravity if percent.unwrap_or(0.0) >= 90.0 => {
+            native_interop::provider_color(
+                Provider::Antigravity,
+                ProviderColorRole::TrayHighUsageText,
+                false,
+            )
+        }
+        TrayIconKind::Antigravity => native_interop::provider_color(
+            Provider::Antigravity,
+            ProviderColorRole::TrayText,
+            false,
+        ),
+        TrayIconKind::Grok if percent.unwrap_or(0.0) >= 90.0 => native_interop::provider_color(
+            Provider::Grok,
+            ProviderColorRole::TrayHighUsageText,
+            false,
+        ),
+        TrayIconKind::Grok => {
+            native_interop::provider_color(Provider::Grok, ProviderColorRole::TrayText, false)
+        }
+        TrayIconKind::Cursor if percent.unwrap_or(0.0) >= 90.0 => native_interop::provider_color(
+            Provider::Cursor,
+            ProviderColorRole::TrayHighUsageText,
+            false,
+        ),
+        TrayIconKind::Cursor => {
+            native_interop::provider_color(Provider::Cursor, ProviderColorRole::TrayText, false)
+        }
     };
     let outline_col = match kind {
         TrayIconKind::Claude => fill,
-        TrayIconKind::Codex if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#111111"),
-        TrayIconKind::Codex => Color::from_hex("#FFFFFF"),
-        TrayIconKind::Antigravity if percent.unwrap_or(0.0) >= 90.0 => Color::from_hex("#1967D2"),
-        TrayIconKind::Antigravity => Color::from_hex("#FFFFFF"),
+        TrayIconKind::Codex if percent.unwrap_or(0.0) >= 90.0 => native_interop::provider_color(
+            Provider::Codex,
+            ProviderColorRole::TrayHighUsageText,
+            false,
+        ),
+        TrayIconKind::Codex => {
+            native_interop::provider_color(Provider::Codex, ProviderColorRole::TrayText, false)
+        }
+        TrayIconKind::Antigravity if percent.unwrap_or(0.0) >= 90.0 => {
+            native_interop::provider_color(
+                Provider::Antigravity,
+                ProviderColorRole::TrayHighUsageText,
+                false,
+            )
+        }
+        TrayIconKind::Antigravity => native_interop::provider_color(
+            Provider::Antigravity,
+            ProviderColorRole::TrayText,
+            false,
+        ),
+        TrayIconKind::Grok if percent.unwrap_or(0.0) >= 90.0 => native_interop::provider_color(
+            Provider::Grok,
+            ProviderColorRole::TrayHighUsageText,
+            false,
+        ),
+        TrayIconKind::Grok => {
+            native_interop::provider_color(Provider::Grok, ProviderColorRole::TrayText, false)
+        }
+        TrayIconKind::Cursor if percent.unwrap_or(0.0) >= 90.0 => native_interop::provider_color(
+            Provider::Cursor,
+            ProviderColorRole::TrayHighUsageText,
+            false,
+        ),
+        TrayIconKind::Cursor => {
+            native_interop::provider_color(Provider::Cursor, ProviderColorRole::TrayText, false)
+        }
     };
 
     let display_text = match percent {
@@ -147,6 +231,8 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
             TrayIconKind::Claude => String::new(),
             TrayIconKind::Codex => "C".to_string(),
             TrayIconKind::Antigravity => "A".to_string(),
+            TrayIconKind::Grok => "G".to_string(),
+            TrayIconKind::Cursor => "U".to_string(),
         },
     };
 
@@ -417,6 +503,12 @@ pub fn sync(hwnd: HWND, icons: &[TrayIconData]) {
     let show_antigravity = icons
         .iter()
         .find(|icon| matches!(icon.kind, TrayIconKind::Antigravity));
+    let show_grok = icons
+        .iter()
+        .find(|icon| matches!(icon.kind, TrayIconKind::Grok));
+    let show_cursor = icons
+        .iter()
+        .find(|icon| matches!(icon.kind, TrayIconKind::Cursor));
 
     if let Some(icon) = show_claude {
         add(hwnd, icon.kind, icon.percent, &icon.tooltip);
@@ -438,12 +530,28 @@ pub fn sync(hwnd: HWND, icons: &[TrayIconData]) {
     } else {
         remove(hwnd, TrayIconKind::Antigravity);
     }
+
+    if let Some(icon) = show_grok {
+        add(hwnd, icon.kind, icon.percent, &icon.tooltip);
+        update(hwnd, icon.kind, icon.percent, &icon.tooltip);
+    } else {
+        remove(hwnd, TrayIconKind::Grok);
+    }
+
+    if let Some(icon) = show_cursor {
+        add(hwnd, icon.kind, icon.percent, &icon.tooltip);
+        update(hwnd, icon.kind, icon.percent, &icon.tooltip);
+    } else {
+        remove(hwnd, TrayIconKind::Cursor);
+    }
 }
 
 pub fn remove_all(hwnd: HWND) {
     remove(hwnd, TrayIconKind::Claude);
     remove(hwnd, TrayIconKind::Codex);
     remove(hwnd, TrayIconKind::Antigravity);
+    remove(hwnd, TrayIconKind::Grok);
+    remove(hwnd, TrayIconKind::Cursor);
 }
 
 /// Interpret a tray callback message and return the action to take.
