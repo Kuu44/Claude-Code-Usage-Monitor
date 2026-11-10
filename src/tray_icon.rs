@@ -13,6 +13,8 @@ use crate::native_interop::{self, Color, Provider, ProviderColorRole, WM_APP_TRA
 const CLAUDE_TRAY_ICON_ID: u32 = 1;
 const CODEX_TRAY_ICON_ID: u32 = 2;
 const ANTIGRAVITY_TRAY_ICON_ID: u32 = 3;
+const ANTIGRAVITY_CLAUDE_TRAY_ICON_ID: u32 = 6;
+const ANTIGRAVITY_ARGON_TRAY_ICON_ID: u32 = 7;
 const GROK_TRAY_ICON_ID: u32 = 4;
 const CURSOR_TRAY_ICON_ID: u32 = 5;
 
@@ -31,6 +33,8 @@ pub enum TrayIconKind {
     Claude,
     Codex,
     Antigravity,
+    AntigravityClaude,
+    AntigravityArgon,
     Grok,
     Cursor,
 }
@@ -47,6 +51,8 @@ impl TrayIconKind {
             Self::Claude => CLAUDE_TRAY_ICON_ID,
             Self::Codex => CODEX_TRAY_ICON_ID,
             Self::Antigravity => ANTIGRAVITY_TRAY_ICON_ID,
+            Self::AntigravityClaude => ANTIGRAVITY_CLAUDE_TRAY_ICON_ID,
+            Self::AntigravityArgon => ANTIGRAVITY_ARGON_TRAY_ICON_ID,
             Self::Grok => GROK_TRAY_ICON_ID,
             Self::Cursor => CURSOR_TRAY_ICON_ID,
         }
@@ -57,7 +63,9 @@ fn provider_for_kind(kind: TrayIconKind) -> Provider {
     match kind {
         TrayIconKind::Claude => Provider::Claude,
         TrayIconKind::Codex => Provider::Codex,
-        TrayIconKind::Antigravity => Provider::Antigravity,
+        TrayIconKind::Antigravity
+        | TrayIconKind::AntigravityClaude
+        | TrayIconKind::AntigravityArgon => Provider::Antigravity,
         TrayIconKind::Grok => Provider::Grok,
         TrayIconKind::Cursor => Provider::Cursor,
     }
@@ -124,7 +132,12 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
     let radius = 2_i32;
     let outline = if matches!(
         kind,
-        TrayIconKind::Codex | TrayIconKind::Antigravity | TrayIconKind::Grok | TrayIconKind::Cursor
+        TrayIconKind::Codex
+            | TrayIconKind::Antigravity
+            | TrayIconKind::AntigravityClaude
+            | TrayIconKind::AntigravityArgon
+            | TrayIconKind::Grok
+            | TrayIconKind::Cursor
     ) {
         3_i32
     } else {
@@ -156,14 +169,20 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
         TrayIconKind::Codex => {
             native_interop::provider_color(Provider::Codex, ProviderColorRole::TrayText, false)
         }
-        TrayIconKind::Antigravity if percent.unwrap_or(0.0) >= 90.0 => {
+        TrayIconKind::Antigravity
+        | TrayIconKind::AntigravityClaude
+        | TrayIconKind::AntigravityArgon
+            if percent.unwrap_or(0.0) >= 90.0 =>
+        {
             native_interop::provider_color(
                 Provider::Antigravity,
                 ProviderColorRole::TrayHighUsageText,
                 false,
             )
         }
-        TrayIconKind::Antigravity => native_interop::provider_color(
+        TrayIconKind::Antigravity
+        | TrayIconKind::AntigravityClaude
+        | TrayIconKind::AntigravityArgon => native_interop::provider_color(
             Provider::Antigravity,
             ProviderColorRole::TrayText,
             false,
@@ -195,14 +214,20 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
         TrayIconKind::Codex => {
             native_interop::provider_color(Provider::Codex, ProviderColorRole::TrayText, false)
         }
-        TrayIconKind::Antigravity if percent.unwrap_or(0.0) >= 90.0 => {
+        TrayIconKind::Antigravity
+        | TrayIconKind::AntigravityClaude
+        | TrayIconKind::AntigravityArgon
+            if percent.unwrap_or(0.0) >= 90.0 =>
+        {
             native_interop::provider_color(
                 Provider::Antigravity,
                 ProviderColorRole::TrayHighUsageText,
                 false,
             )
         }
-        TrayIconKind::Antigravity => native_interop::provider_color(
+        TrayIconKind::Antigravity
+        | TrayIconKind::AntigravityClaude
+        | TrayIconKind::AntigravityArgon => native_interop::provider_color(
             Provider::Antigravity,
             ProviderColorRole::TrayText,
             false,
@@ -230,7 +255,9 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
         None => match kind {
             TrayIconKind::Claude => String::new(),
             TrayIconKind::Codex => "C".to_string(),
-            TrayIconKind::Antigravity => "A".to_string(),
+            TrayIconKind::Antigravity
+            | TrayIconKind::AntigravityClaude
+            | TrayIconKind::AntigravityArgon => "A".to_string(),
             TrayIconKind::Grok => "G".to_string(),
             TrayIconKind::Cursor => "U".to_string(),
         },
@@ -342,12 +369,15 @@ pub fn create_icon(kind: TrayIconKind, percent: Option<f64>) -> HICON {
             bottom: size - margin,
         };
         let mut text_wide: Vec<u16> = display_text.encode_utf16().collect();
-        let _ = DrawTextW(
-            mem_dc,
-            &mut text_wide,
-            &mut text_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
+        // No percentage yet can produce an empty slice with a dangling pointer.
+        if !text_wide.is_empty() {
+            let _ = DrawTextW(
+                mem_dc,
+                &mut text_wide,
+                &mut text_rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
 
         SelectObject(mem_dc, old_font);
         let _ = DeleteObject(font);
@@ -503,6 +533,12 @@ pub fn sync(hwnd: HWND, icons: &[TrayIconData]) {
     let show_antigravity = icons
         .iter()
         .find(|icon| matches!(icon.kind, TrayIconKind::Antigravity));
+    let show_antigravity_claude = icons
+        .iter()
+        .find(|icon| matches!(icon.kind, TrayIconKind::AntigravityClaude));
+    let show_antigravity_argon = icons
+        .iter()
+        .find(|icon| matches!(icon.kind, TrayIconKind::AntigravityArgon));
     let show_grok = icons
         .iter()
         .find(|icon| matches!(icon.kind, TrayIconKind::Grok));
@@ -531,6 +567,20 @@ pub fn sync(hwnd: HWND, icons: &[TrayIconData]) {
         remove(hwnd, TrayIconKind::Antigravity);
     }
 
+    if let Some(icon) = show_antigravity_claude {
+        add(hwnd, icon.kind, icon.percent, &icon.tooltip);
+        update(hwnd, icon.kind, icon.percent, &icon.tooltip);
+    } else {
+        remove(hwnd, TrayIconKind::AntigravityClaude);
+    }
+
+    if let Some(icon) = show_antigravity_argon {
+        add(hwnd, icon.kind, icon.percent, &icon.tooltip);
+        update(hwnd, icon.kind, icon.percent, &icon.tooltip);
+    } else {
+        remove(hwnd, TrayIconKind::AntigravityArgon);
+    }
+
     if let Some(icon) = show_grok {
         add(hwnd, icon.kind, icon.percent, &icon.tooltip);
         update(hwnd, icon.kind, icon.percent, &icon.tooltip);
@@ -547,6 +597,8 @@ pub fn sync(hwnd: HWND, icons: &[TrayIconData]) {
 }
 
 pub fn remove_all(hwnd: HWND) {
+    remove(hwnd, TrayIconKind::AntigravityClaude);
+    remove(hwnd, TrayIconKind::AntigravityArgon);
     remove(hwnd, TrayIconKind::Claude);
     remove(hwnd, TrayIconKind::Codex);
     remove(hwnd, TrayIconKind::Antigravity);
@@ -574,4 +626,33 @@ fn copy_to_tip(s: &str, tip: &mut [u16; 128]) {
     }
     tip[..len].copy_from_slice(&wide[..len]);
     tip[len] = 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn independent_pools_have_unique_ids_and_shared_antigravity_color() {
+        let kinds = [
+            TrayIconKind::Claude,
+            TrayIconKind::Codex,
+            TrayIconKind::Antigravity,
+            TrayIconKind::AntigravityClaude,
+            TrayIconKind::AntigravityArgon,
+            TrayIconKind::Grok,
+            TrayIconKind::Cursor,
+        ];
+        let mut ids: Vec<_> = kinds.iter().map(|kind| kind.id()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), kinds.len());
+        for kind in [
+            TrayIconKind::Antigravity,
+            TrayIconKind::AntigravityClaude,
+            TrayIconKind::AntigravityArgon,
+        ] {
+            assert_eq!(provider_for_kind(kind), Provider::Antigravity);
+        }
+    }
 }
