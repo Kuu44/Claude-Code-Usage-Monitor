@@ -216,6 +216,14 @@ Notes:
 - Portable installs can update themselves by downloading the latest release from this fork
 - Proxies should be trusted because proxied usage requests include your OAuth bearer token inside the TLS connection
 
+## Antigravity quota pools
+
+The model selector exposes three independent Antigravity choices: **Gemini Flash/Pro**, **Claude/GPT**, and **Gemini 4 Argon**. Gemini Flash/Pro and Claude/GPT each show five-hour and weekly quotas. Argon has a separate weekly quota and leaves the five-hour row empty. All three use the same Antigravity sign-in and one quota request per refresh.
+
+Antigravity row text explicitly shows **remaining** quota to match its usage panel. Bar fills and tray badges continue to represent **used** quota, consistent with the other providers and high-usage warning colors. Tray tooltips label this distinction. Existing Antigravity selections keep Gemini Flash/Pro enabled; the other pools can be enabled separately.
+
+The monitor uses a pinned compatible Antigravity hub quota header: older client headers can silently omit Gemini and Argon pools. Missing pools stay unavailable; they never borrow another pool's quota. If the time-window quota endpoint is unavailable, the monitor reports a failure rather than interpreting ambiguous legacy model quotas as five-hour limits.
+
 ## How It Works
 
 The monitor:
