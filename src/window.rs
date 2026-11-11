@@ -22,7 +22,9 @@ use windows::Win32::UI::Controls::{
     ODS_NOFOCUSRECT, ODS_SELECTED, ODT_MENU, TMT_FILLCOLOR,
 };
 use windows::Win32::UI::HiDpi::*;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, SetFocus, VK_LEFT, VK_RIGHT,
+};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -133,6 +135,11 @@ struct AppState {
     taskbar_side: TaskbarSide,
     tray_offset: i32,
     dragging: bool,
+    resizing: bool,
+    resize_start_width: i32,
+    resize_start_left: i32,
+    widget_width: Option<i32>,
+    logo_modes: [bool; 7],
     drag_start_mouse_x: i32,
     drag_start_client_x: i32,
     drag_start_offset: i32,
@@ -393,6 +400,10 @@ struct SettingsFile {
     #[serde(default)]
     tray_offset: i32,
     #[serde(default)]
+    widget_width: Option<i32>,
+    #[serde(default)]
+    logo_modes: [bool; 7],
+    #[serde(default)]
     taskbar_index: usize,
     #[serde(default)]
     taskbar_side: TaskbarSide,
@@ -424,6 +435,8 @@ impl Default for SettingsFile {
     fn default() -> Self {
         Self {
             tray_offset: 0,
+            widget_width: None,
+            logo_modes: [false; 7],
             taskbar_index: 0,
             taskbar_side: TaskbarSide::default(),
             poll_interval_ms: default_poll_interval(),
@@ -499,6 +512,8 @@ fn save_state_settings() {
     if let Some(s) = state.as_ref() {
         save_settings(&SettingsFile {
             tray_offset: s.tray_offset,
+            widget_width: s.widget_width,
+            logo_modes: s.logo_modes,
             taskbar_index: s.taskbar_index,
             taskbar_side: s.taskbar_side,
             poll_interval_ms: s.poll_interval_ms,
@@ -984,7 +999,7 @@ fn antigravity_section_text(section: &crate::models::UsageSection, strings: Stri
         percentage: 100.0 - section.percentage.clamp(0.0, 100.0),
         resets_at: section.resets_at,
     };
-    poller::format_line(&remaining, strings).replacen('%', &format!("% {}", strings.remaining), 1)
+    poller::format_line(&remaining, strings)
 }
 
 fn provider_usage_texts(
@@ -1505,22 +1520,16 @@ fn set_startup_enabled(enable: bool) {
 }
 
 // Dimensions matching the C# version
-const SEGMENT_W: i32 = 10;
 const SEGMENT_H: i32 = 13;
-const SEGMENT_GAP: i32 = 1;
-const SEGMENT_COUNT: i32 = 10;
 const CORNER_RADIUS: i32 = 2;
 
 const LEFT_DIVIDER_W: i32 = 3;
-const DIVIDER_RIGHT_MARGIN: i32 = 10;
+const DIVIDER_RIGHT_MARGIN: i32 = 5;
 // Fits mixed labels at the 12px font size: seven 8px Latin/Cyrillic glyphs,
 // or the shorter labels containing 12px CJK glyphs. Scaled with the other columns.
 const LABEL_WIDTH: i32 = 56;
-const LABEL_RIGHT_MARGIN: i32 = 10;
-const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 148;
-const MODEL_RIGHT_MARGIN: i32 = 3;
-const RIGHT_MARGIN: i32 = 1;
+const LABEL_RIGHT_MARGIN: i32 = 9;
+const TEXT_WIDTH: i32 = crate::widget_layout::TEXT_WIDTH;
 const WIDGET_HEIGHT: i32 = 46;
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
@@ -2422,60 +2431,74 @@ fn top_window_label(
     }
 }
 
-fn row_bar_segment_count(active_models: i32) -> i32 {
-    match active_models {
-        1 => SEGMENT_COUNT,
-        2 => 5,
-        _ => 4,
-    }
+fn enabled_models(s: &AppState) -> [bool; 7] {
+    [
+        s.show_claude_code,
+        s.show_codex,
+        s.show_antigravity,
+        s.show_antigravity_claude,
+        s.show_antigravity_argon,
+        s.show_grok,
+        s.show_cursor,
+    ]
 }
 
 fn total_widget_width_for(active_models: i32) -> i32 {
-    let bar_segments = row_bar_segment_count(active_models);
-    let model_width = (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * bar_segments - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH);
+    let mut enabled = [false; 7];
+    enabled[..active_models.clamp(1, 7) as usize].fill(true);
+    sc(crate::widget_layout::layout(None, enabled, [false; 7]).width)
+}
 
-    sc(LEFT_DIVIDER_W)
-        + sc(DIVIDER_RIGHT_MARGIN)
-        + sc(LABEL_WIDTH)
-        + sc(LABEL_RIGHT_MARGIN)
-        + model_width * active_models
-        + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
-        + sc(RIGHT_MARGIN)
+fn layout_for_state(state: &AppState) -> crate::widget_layout::Layout {
+    let initial =
+        crate::widget_layout::layout(state.widget_width, enabled_models(state), state.logo_modes);
+    let limit = state.taskbar_hwnd.and_then(|hwnd| {
+        native_interop::get_window_rect_safe(hwnd).map(|rect| {
+            ((tray_left_for_taskbar(hwnd, rect) - rect.left).max(0) as f64 * 96.0
+                / CURRENT_DPI.load(Ordering::Relaxed) as f64)
+                .floor() as i32
+        })
+    });
+    match limit {
+        Some(max) if initial.width > max => {
+            crate::widget_layout::layout(Some(max), enabled_models(state), state.logo_modes)
+        }
+        _ => initial,
+    }
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_model_count(
-        state.show_claude_code,
-        state.show_codex,
-        state.show_antigravity,
-        state.show_antigravity_claude,
-        state.show_antigravity_argon,
-        state.show_grok,
-        state.show_cursor,
-    ))
+    sc(layout_for_state(state).width)
 }
 
 fn total_widget_width() -> i32 {
-    let active_models = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| {
-                active_model_count(
-                    s.show_claude_code,
-                    s.show_codex,
-                    s.show_antigravity,
-                    s.show_antigravity_claude,
-                    s.show_antigravity_argon,
-                    s.show_grok,
-                    s.show_cursor,
-                )
-            })
-            .unwrap_or(1)
-    };
-    total_widget_width_for(active_models)
+    let state = lock_state();
+    state
+        .as_ref()
+        .map(total_widget_width_for_state)
+        .unwrap_or_else(|| total_widget_width_for(1))
+}
+
+fn resize_handle_point(x: i32, y: i32, width: i32) -> bool {
+    x >= width - sc(crate::widget_layout::GRIP) && x < width && y >= 0 && y < sc(WIDGET_HEIGHT)
+}
+
+fn adjust_widget_width(delta: i32) {
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            let minimum =
+                crate::widget_layout::layout(Some(0), enabled_models(s), s.logo_modes).width;
+            let current = (total_widget_width_for_state(s) as f64 * 96.0
+                / CURRENT_DPI.load(Ordering::Relaxed) as f64)
+                .round() as i32;
+            s.widget_width =
+                Some((s.widget_width.unwrap_or(current).max(minimum) + delta).max(minimum));
+        }
+    }
+    save_state_settings();
+    position_at_taskbar();
+    render_layered();
 }
 
 fn claude_accent_color() -> Color {
@@ -2496,26 +2519,6 @@ fn grok_accent_color(is_dark: bool) -> Color {
 
 fn cursor_accent_color(is_dark: bool) -> Color {
     native_interop::provider_color(Provider::Cursor, ProviderColorRole::Bar, is_dark)
-}
-
-fn claude_usage_text_color(is_dark: bool) -> Color {
-    native_interop::provider_color(Provider::Claude, ProviderColorRole::MenuValue, is_dark)
-}
-
-fn codex_usage_text_color(is_dark: bool) -> Color {
-    native_interop::provider_color(Provider::Codex, ProviderColorRole::MenuValue, is_dark)
-}
-
-fn antigravity_usage_text_color(is_dark: bool) -> Color {
-    native_interop::provider_color(Provider::Antigravity, ProviderColorRole::MenuValue, is_dark)
-}
-
-fn grok_usage_text_color(is_dark: bool) -> Color {
-    native_interop::provider_color(Provider::Grok, ProviderColorRole::MenuValue, is_dark)
-}
-
-fn cursor_usage_text_color(is_dark: bool) -> Color {
-    native_interop::provider_color(Provider::Cursor, ProviderColorRole::MenuValue, is_dark)
 }
 
 pub fn run() {
@@ -2706,6 +2709,11 @@ pub fn run() {
                 taskbar_side: settings.taskbar_side,
                 tray_offset: settings.tray_offset,
                 dragging: false,
+                resizing: false,
+                resize_start_width: 0,
+                resize_start_left: 0,
+                widget_width: settings.widget_width,
+                logo_modes: settings.logo_modes,
                 drag_start_mouse_x: 0,
                 drag_start_client_x: 0,
                 drag_start_offset: 0,
@@ -3114,6 +3122,18 @@ fn paint_content(
         FillRect(hdc, &client_rect, bg_brush);
         let _ = DeleteObject(bg_brush);
 
+        // Right-edge resize grip: full-height hit target with a visible pair of strokes.
+        let grip_brush = CreateSolidBrush(COLORREF(text_color.to_colorref()));
+        for inset in [4, 7] {
+            let grip = RECT {
+                left: width - sc(inset),
+                right: width - sc(inset) + sc(1).max(1),
+                top: sc(12),
+                bottom: height - sc(12),
+            };
+            FillRect(hdc, &grip, grip_brush);
+        }
+        let _ = DeleteObject(grip_brush);
         // Left divider
         let divider_h = sc(25);
         let divider_top = (height - divider_h) / 2;
@@ -3993,6 +4013,14 @@ unsafe extern "system" fn wnd_proc(
                 SetCursor(cursor);
                 return LRESULT(1);
             }
+            let mut cursor_pt = POINT::default();
+            let _ = GetCursorPos(&mut cursor_pt);
+            let _ = ScreenToClient(hwnd, &mut cursor_pt);
+            let resizing = lock_state().as_ref().is_some_and(|s| s.resizing);
+            if resizing || resize_handle_point(cursor_pt.x, cursor_pt.y, total_widget_width()) {
+                SetCursor(LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default());
+                return LRESULT(1);
+            }
             if cursor_is_on_drag_handle(hwnd) {
                 let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
                 SetCursor(cursor);
@@ -4003,6 +4031,24 @@ unsafe extern "system" fn wnd_proc(
         WM_LBUTTONDOWN => {
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
             let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            if resize_handle_point(client_x, client_y, total_widget_width()) {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let mut rect = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut rect);
+                {
+                    let mut state = lock_state();
+                    if let Some(s) = state.as_mut() {
+                        s.resizing = true;
+                        s.resize_start_width = total_widget_width_for_state(s);
+                        s.resize_start_left = rect.left;
+                        s.drag_start_mouse_x = pt.x;
+                    }
+                }
+                SetCapture(hwnd);
+                let _ = SetFocus(hwnd);
+                return LRESULT(0);
+            }
             if !is_drag_handle_point(client_x, client_y) {
                 return LRESULT(0);
             }
@@ -4020,6 +4066,35 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let resize = {
+                let mut state = lock_state();
+                state.as_mut().filter(|s| s.resizing).map(|s| {
+                    let desired = (s.resize_start_width + pt.x - s.drag_start_mouse_x).max(0);
+                    s.widget_width = Some(
+                        (desired as f64 * 96.0 / CURRENT_DPI.load(Ordering::Relaxed) as f64).round()
+                            as i32,
+                    );
+                    // Preserve the left edge even for a right-anchored widget.
+                    if let Some(taskbar) = s.taskbar_hwnd {
+                        let mut rect = RECT::default();
+                        let _ = GetWindowRect(taskbar, &mut rect);
+                        if s.taskbar_side == TaskbarSide::Right {
+                            let tray_left = tray_left_for_taskbar(taskbar, rect);
+                            s.tray_offset =
+                                (tray_left - s.resize_start_left - total_widget_width_for_state(s))
+                                    .max(0);
+                        }
+                    }
+                })
+            };
+            if resize.is_some() {
+                position_at_taskbar();
+                render_layered();
+                return LRESULT(0);
+            }
+
             let is_dragging = {
                 let state = lock_state();
                 state.as_ref().map(|s| s.dragging).unwrap_or(false)
@@ -4130,7 +4205,40 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        WM_CAPTURECHANGED => {
+            {
+                let mut state = lock_state();
+                if let Some(s) = state.as_mut() {
+                    s.resizing = false;
+                    s.dragging = false;
+                }
+            }
+            save_state_settings();
+            LRESULT(0)
+        }
+        WM_KEYDOWN if (wparam.0 == VK_LEFT.0 as usize || wparam.0 == VK_RIGHT.0 as usize) => {
+            adjust_widget_width(if wparam.0 == VK_LEFT.0 as usize {
+                -12
+            } else {
+                12
+            });
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
+            let resized = {
+                let mut state = lock_state();
+                state.as_mut().is_some_and(|s| {
+                    let was = s.resizing;
+                    s.resizing = false;
+                    was
+                })
+            };
+            if resized {
+                let _ = ReleaseCapture();
+                save_state_settings();
+                return LRESULT(0);
+            }
+
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let drag_result = {
@@ -4180,6 +4288,30 @@ unsafe extern "system" fn wnd_proc(
         WM_COMMAND => {
             let id = wparam.0 as u16;
             match id {
+                200..=213 => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.logo_modes[((id - 200) / 2) as usize] = (id - 200) % 2 == 1;
+                        }
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                }
+                214 => adjust_widget_width(-24),
+                215 => adjust_widget_width(24),
+                216 => {
+                    {
+                        let mut state = lock_state();
+                        if let Some(s) = state.as_mut() {
+                            s.widget_width = None;
+                        }
+                    }
+                    save_state_settings();
+                    position_at_taskbar();
+                    render_layered();
+                }
                 1 => {
                     {
                         let mut state = lock_state();
@@ -4500,6 +4632,111 @@ mod tests {
     use crate::tray_icon;
 
     #[test]
+    fn compact_text_columns_fit_real_font_and_resize_grip_stays_outside_data() {
+        assert_eq!(
+            super::LEFT_DIVIDER_W
+                + super::DIVIDER_RIGHT_MARGIN
+                + super::LABEL_WIDTH
+                + super::LABEL_RIGHT_MARGIN,
+            crate::widget_layout::LEADING
+        );
+        assert!(!super::resize_handle_point(89, 20, 100));
+        assert!(super::resize_handle_point(95, 20, 100));
+        assert!(!super::resize_handle_point(100, 20, 100));
+        unsafe {
+            use windows::core::PCWSTR;
+            use windows::Win32::Graphics::Gdi::*;
+            let dc = CreateCompatibleDC(HDC::default());
+            let face = super::native_interop::wide_str("Segoe UI");
+            let font = CreateFontW(
+                -12,
+                0,
+                0,
+                0,
+                FW_MEDIUM.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET.0 as u32,
+                OUT_TT_PRECIS.0 as u32,
+                CLIP_DEFAULT_PRECIS.0 as u32,
+                CLEARTYPE_QUALITY.0 as u32,
+                (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+                PCWSTR::from_raw(face.as_ptr()),
+            );
+            let old = SelectObject(dc, font);
+            for language in crate::localization::LanguageId::ALL {
+                for hours in [1, 164, 999] {
+                    let section = crate::models::UsageSection {
+                        percentage: 100.0,
+                        resets_at: Some(
+                            std::time::SystemTime::now()
+                                + std::time::Duration::from_secs(hours * 3600),
+                        ),
+                    };
+                    let text = crate::poller::format_line(&section, language.strings());
+                    let wide: Vec<u16> = text.encode_utf16().collect();
+                    let mut size = super::SIZE::default();
+                    GetTextExtentPoint32W(dc, &wide, &mut size).unwrap();
+                    assert!(
+                        size.cx <= crate::widget_layout::TEXT_WIDTH,
+                        "{text} needs {}px",
+                        size.cx
+                    );
+                }
+            }
+            SelectObject(dc, old);
+            let _ = DeleteObject(font);
+            let _ = DeleteDC(dc);
+        }
+    }
+
+    #[test]
+    fn compact_preferences_roundtrip_and_old_settings_keep_bars() {
+        let mut settings: SettingsFile = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.widget_width, None);
+        assert_eq!(settings.logo_modes, [false; 7]);
+        settings.widget_width = Some(600);
+        settings.logo_modes = [true, false, true, false, true, false, true];
+        let restored: SettingsFile =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.widget_width, Some(600));
+        assert_eq!(restored.logo_modes, settings.logo_modes);
+    }
+
+    #[test]
+    fn provider_logo_resources_load_with_native_icon_decoder() {
+        // Validate actual embedded resources, including their transparency masks.
+        for bytes in [
+            include_bytes!("icons/providers/claude-light.ico").as_slice(),
+            include_bytes!("icons/providers/claude-dark.ico").as_slice(),
+            include_bytes!("icons/providers/openai-light.ico").as_slice(),
+            include_bytes!("icons/providers/openai-dark.ico").as_slice(),
+            include_bytes!("icons/providers/antigravity-light.ico").as_slice(),
+            include_bytes!("icons/providers/antigravity-dark.ico").as_slice(),
+            include_bytes!("icons/providers/grok-light.ico").as_slice(),
+            include_bytes!("icons/providers/grok-dark.ico").as_slice(),
+            include_bytes!("icons/providers/cursor-light.ico").as_slice(),
+            include_bytes!("icons/providers/cursor-dark.ico").as_slice(),
+        ] {
+            let offset = u32::from_le_bytes(bytes[18..22].try_into().unwrap()) as usize;
+            unsafe {
+                let icon = super::CreateIconFromResourceEx(
+                    &bytes[offset..],
+                    true,
+                    0x00030000,
+                    64,
+                    64,
+                    super::LR_DEFAULTCOLOR,
+                )
+                .expect("embedded logo must decode");
+                assert!(!icon.is_invalid());
+                let _ = super::DestroyIcon(icon);
+            }
+        }
+    }
+
+    #[test]
     fn antigravity_old_settings_migrate_only_to_gemini_and_new_flags_roundtrip() {
         let mut old: SettingsFile =
             serde_json::from_str(r#"{"show_claude_code":false,"show_antigravity":true}"#).unwrap();
@@ -4538,7 +4775,7 @@ mod tests {
                     strings,
                 );
                 assert!(text.starts_with(&format!("{remaining:.0}%")), "{text}");
-                assert!(text.contains(&format!("% {}", strings.remaining)));
+                assert!(!text.contains("remaining"));
                 assert!(text.contains('\u{00b7}'));
             }
             for percentage in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -4587,7 +4824,7 @@ mod tests {
         };
         let rows = super::antigravity_usage_texts(true, Some(&missing), false, strings);
         assert!(rows.0.is_empty());
-        assert_eq!(rows.1, "77% remaining");
+        assert_eq!(rows.1, "77%");
     }
 
     #[test]
@@ -4650,7 +4887,7 @@ mod tests {
             strings,
         );
         assert_eq!(argon.percent, Some(23.0));
-        assert!(argon.tooltip.contains("23% used / 77% remaining"));
+        assert!(argon.tooltip.contains("23% used / 77%"));
         assert!(!argon.tooltip.contains("5h"));
         let gemini = super::antigravity_tray_data(
             tray_icon::TrayIconKind::Antigravity,
@@ -4660,7 +4897,7 @@ mod tests {
             strings,
         );
         assert_eq!(gemini.percent, Some(82.0));
-        assert!(gemini.tooltip.contains("82% used / 18% remaining"));
+        assert!(gemini.tooltip.contains("82% used / 18%"));
         usage.session.percentage = f64::NAN;
         let missing = super::antigravity_tray_data(
             tray_icon::TrayIconKind::AntigravityClaude,
@@ -5607,6 +5844,64 @@ fn show_context_menu(hwnd: HWND) {
 
         // Settings submenu
         let settings_menu = CreatePopupMenu().unwrap();
+        let appearance_menu = CreatePopupMenu().unwrap();
+        let logo_modes = lock_state()
+            .as_ref()
+            .map(|s| s.logo_modes)
+            .unwrap_or([false; 7]);
+        let labels = [
+            strings.claude_code_model,
+            strings.codex_model,
+            strings.antigravity_model,
+            strings.antigravity_claude_model,
+            strings.antigravity_argon_model,
+            strings.grok_model,
+            strings.cursor_model,
+        ];
+        for (i, label) in labels.into_iter().enumerate() {
+            let sub = CreatePopupMenu().unwrap();
+            for (offset, text) in [(0, strings.progress_bars), (1, strings.provider_logo)] {
+                let wide = native_interop::wide_str(text);
+                let flags = if logo_modes[i] == (offset == 1) {
+                    MF_CHECKED
+                } else {
+                    MENU_ITEM_FLAGS(0)
+                };
+                let _ = AppendMenuW(
+                    sub,
+                    flags,
+                    200 + i * 2 + offset,
+                    PCWSTR::from_raw(wide.as_ptr()),
+                );
+            }
+            let wide = native_interop::wide_str(label);
+            let _ = AppendMenuW(
+                appearance_menu,
+                MF_POPUP,
+                sub.0 as usize,
+                PCWSTR::from_raw(wide.as_ptr()),
+            );
+        }
+        for (id, text) in [
+            (214, strings.narrower),
+            (215, strings.wider),
+            (216, strings.reset_width),
+        ] {
+            let wide = native_interop::wide_str(text);
+            let _ = AppendMenuW(
+                appearance_menu,
+                MENU_ITEM_FLAGS(0),
+                id,
+                PCWSTR::from_raw(wide.as_ptr()),
+            );
+        }
+        let wide = native_interop::wide_str(strings.appearance_width);
+        let _ = AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            appearance_menu.0 as usize,
+            PCWSTR::from_raw(wide.as_ptr()),
+        );
 
         let startup_str = native_interop::wide_str(strings.start_with_windows);
         let startup_flags = if is_startup_enabled() {
@@ -6051,8 +6346,7 @@ fn draw_row(
     cursor_accent: &Color,
     track: &Color,
 ) {
-    let seg_h = sc(SEGMENT_H);
-    let active_models = active_model_count(
+    let enabled = [
         show_claude_code,
         show_codex,
         show_antigravity,
@@ -6060,13 +6354,50 @@ fn draw_row(
         show_antigravity_argon,
         show_grok,
         show_cursor,
-    );
-    let segment_count = row_bar_segment_count(active_models);
-    let claude_value_color = claude_usage_text_color(is_dark);
-    let codex_value_color = codex_usage_text_color(is_dark);
-    let antigravity_value_color = antigravity_usage_text_color(is_dark);
-    let grok_value_color = grok_usage_text_color(is_dark);
-    let cursor_value_color = cursor_usage_text_color(is_dark);
+    ];
+    let layout = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(layout_for_state)
+            .unwrap_or_else(|| crate::widget_layout::layout(None, enabled, [false; 7]))
+    };
+    let percents = [
+        claude_percent,
+        codex_percent,
+        antigravity_percent,
+        antigravity_claude_percent,
+        antigravity_argon_percent,
+        grok_percent,
+        cursor_percent,
+    ];
+    let texts = [
+        claude_text,
+        codex_text,
+        antigravity_text,
+        antigravity_claude_text,
+        antigravity_argon_text,
+        grok_text,
+        cursor_text,
+    ];
+    let colors = [
+        claude_accent,
+        codex_accent,
+        antigravity_accent,
+        antigravity_accent,
+        antigravity_accent,
+        grok_accent,
+        cursor_accent,
+    ];
+    let providers = [
+        Provider::Claude,
+        Provider::Codex,
+        Provider::Antigravity,
+        Provider::Antigravity,
+        Provider::Antigravity,
+        Provider::Grok,
+        Provider::Cursor,
+    ];
     let draw_slots = usage_slot_draw_states(
         top_row,
         show_claude_code,
@@ -6084,129 +6415,162 @@ fn draw_row(
         grok_text,
         cursor_text,
     );
-
     unsafe {
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
-        let mut label_rect = RECT {
-            left: x,
-            top: y,
-            right: x + sc(LABEL_WIDTH),
-            bottom: y + seg_h,
-        };
-        draw_nonempty_text(hdc, &mut label_wide, &mut label_rect);
-
-        let mut model_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
-        if show_claude_code {
-            if draw_slots[0] {
-                draw_usage_bar(
+        let mut wide: Vec<u16> = label.encode_utf16().collect();
+        draw_nonempty_text(
+            hdc,
+            &mut wide,
+            &mut RECT {
+                left: x,
+                top: y,
+                right: x + sc(LABEL_WIDTH),
+                bottom: y + sc(SEGMENT_H),
+            },
+        );
+        let mut column_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+        for i in 0..7 {
+            if !enabled[i] {
+                continue;
+            }
+            let graphic = layout.graphics[i];
+            let visual_width = if graphic == crate::widget_layout::Graphic::None {
+                0
+            } else {
+                sc(graphic.width() + crate::widget_layout::GAP)
+            };
+            if draw_slots[i] {
+                match graphic {
+                    crate::widget_layout::Graphic::Bar(width) => draw_compact_bar(
+                        hdc,
+                        column_x,
+                        y,
+                        sc(width),
+                        percents[i],
+                        texts[i],
+                        colors[i],
+                        track,
+                    ),
+                    crate::widget_layout::Graphic::Logo => {
+                        draw_provider_logo(hdc, column_x, y, providers[i], is_dark)
+                    }
+                    crate::widget_layout::Graphic::None => {}
+                }
+                let value_color = native_interop::provider_color(
+                    providers[i],
+                    ProviderColorRole::MenuValue,
+                    is_dark,
+                );
+                let _ = SetTextColor(hdc, COLORREF(value_color.to_colorref()));
+                let mut wide: Vec<u16> = texts[i].encode_utf16().collect();
+                draw_nonempty_text(
                     hdc,
-                    model_x,
-                    y,
-                    segment_count,
-                    claude_percent,
-                    claude_text,
-                    claude_accent,
-                    track,
-                    &claude_value_color,
+                    &mut wide,
+                    &mut RECT {
+                        left: column_x + visual_width,
+                        top: y,
+                        right: column_x + visual_width + sc(TEXT_WIDTH),
+                        bottom: y + sc(SEGMENT_H),
+                    },
                 );
             }
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_codex {
-            if draw_slots[1] {
-                draw_usage_bar(
-                    hdc,
-                    model_x,
-                    y,
-                    segment_count,
-                    codex_percent,
-                    codex_text,
-                    codex_accent,
-                    track,
-                    &codex_value_color,
-                );
-            }
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_antigravity {
-            if draw_slots[2] {
-                draw_usage_bar(
-                    hdc,
-                    model_x,
-                    y,
-                    segment_count,
-                    antigravity_percent,
-                    antigravity_text,
-                    antigravity_accent,
-                    track,
-                    &antigravity_value_color,
-                );
-            }
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_antigravity_claude {
-            if draw_slots[3] {
-                draw_usage_bar(
-                    hdc,
-                    model_x,
-                    y,
-                    segment_count,
-                    antigravity_claude_percent,
-                    antigravity_claude_text,
-                    antigravity_accent,
-                    track,
-                    &antigravity_value_color,
-                );
-            }
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_antigravity_argon {
-            if draw_slots[4] {
-                draw_usage_bar(
-                    hdc,
-                    model_x,
-                    y,
-                    segment_count,
-                    antigravity_argon_percent,
-                    antigravity_argon_text,
-                    antigravity_accent,
-                    track,
-                    &antigravity_value_color,
-                );
-            }
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_grok {
-            if draw_slots[5] {
-                draw_usage_bar(
-                    hdc,
-                    model_x,
-                    y,
-                    segment_count,
-                    grok_percent,
-                    grok_text,
-                    grok_accent,
-                    track,
-                    &grok_value_color,
-                );
-            }
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if draw_slots[6] {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                cursor_percent,
-                cursor_text,
-                cursor_accent,
-                track,
-                &cursor_value_color,
-            );
+            column_x += visual_width + sc(TEXT_WIDTH + crate::widget_layout::GAP);
         }
     }
+}
+
+fn draw_compact_bar(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    width: i32,
+    percent: f64,
+    text: &str,
+    accent: &Color,
+    track: &Color,
+) {
+    let rect = RECT {
+        left: x,
+        top: y,
+        right: x + width,
+        bottom: y + sc(SEGMENT_H),
+    };
+    draw_rounded_rect(hdc, &rect, track, sc(CORNER_RADIUS));
+    let fill = (width as f64 * usage_bar_percent(percent, text) / 100.0).round() as i32;
+    if fill > 0 {
+        draw_rounded_rect(
+            hdc,
+            &RECT {
+                right: x + fill,
+                ..rect
+            },
+            accent,
+            sc(CORNER_RADIUS),
+        );
+    }
+}
+
+fn draw_provider_logo(hdc: HDC, x: i32, y: i32, provider: Provider, dark: bool) {
+    const ICONS: [(&[u8], &[u8]); 5] = [
+        (
+            include_bytes!("icons/providers/claude-light.ico"),
+            include_bytes!("icons/providers/claude-dark.ico"),
+        ),
+        (
+            include_bytes!("icons/providers/openai-light.ico"),
+            include_bytes!("icons/providers/openai-dark.ico"),
+        ),
+        (
+            include_bytes!("icons/providers/antigravity-light.ico"),
+            include_bytes!("icons/providers/antigravity-dark.ico"),
+        ),
+        (
+            include_bytes!("icons/providers/grok-light.ico"),
+            include_bytes!("icons/providers/grok-dark.ico"),
+        ),
+        (
+            include_bytes!("icons/providers/cursor-light.ico"),
+            include_bytes!("icons/providers/cursor-dark.ico"),
+        ),
+    ];
+    thread_local! {static LOGOS:RefCell<[HICON;10]>=const {RefCell::new([HICON(std::ptr::null_mut());10])};}
+    let index = match provider {
+        Provider::Claude => 0,
+        Provider::Codex => 1,
+        Provider::Antigravity => 2,
+        Provider::Grok => 3,
+        Provider::Cursor => 4,
+    };
+    LOGOS.with(|icons| {
+        let mut icons = icons.borrow_mut();
+        let slot = index * 2 + dark as usize;
+        unsafe {
+            if icons[slot].is_invalid() {
+                let data = if dark { ICONS[index].1 } else { ICONS[index].0 };
+                let offset = u32::from_le_bytes(data[18..22].try_into().unwrap()) as usize;
+                icons[slot] = CreateIconFromResourceEx(
+                    &data[offset..],
+                    true,
+                    0x00030000,
+                    64,
+                    64,
+                    LR_DEFAULTCOLOR,
+                )
+                .unwrap_or_default();
+            }
+            let _ = DrawIconEx(
+                hdc,
+                x,
+                y - sc(1),
+                icons[slot],
+                sc(16),
+                sc(16),
+                0,
+                HBRUSH::default(),
+                DI_NORMAL,
+            );
+        }
+    });
 }
 
 fn usage_slot_draw_states(
@@ -6237,95 +6601,11 @@ fn usage_slot_draw_states(
     ]
 }
 
-fn model_usage_width(segment_count: i32) -> i32 {
-    (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH)
-}
-
 fn usage_bar_percent(percent: f64, text: &str) -> f64 {
     if text == "!" {
         0.0
     } else {
         percent.clamp(0.0, 100.0)
-    }
-}
-
-fn draw_usage_bar(
-    hdc: HDC,
-    bar_x: i32,
-    y: i32,
-    segment_count: i32,
-    percent: f64,
-    text: &str,
-    accent: &Color,
-    track: &Color,
-    text_color: &Color,
-) {
-    let seg_w = sc(SEGMENT_W);
-    let seg_h = sc(SEGMENT_H);
-    let seg_gap = sc(SEGMENT_GAP);
-    let corner_r = sc(CORNER_RADIUS);
-
-    unsafe {
-        let percent_clamped = usage_bar_percent(percent, text);
-        let segment_percent = 100.0 / segment_count as f64;
-
-        for i in 0..segment_count {
-            let seg_x = bar_x + i * (seg_w + seg_gap);
-            let seg_start = (i as f64) * segment_percent;
-            let seg_end = seg_start + segment_percent;
-
-            let seg_rect = RECT {
-                left: seg_x,
-                top: y,
-                right: seg_x + seg_w,
-                bottom: y + seg_h,
-            };
-
-            if percent_clamped >= seg_end {
-                draw_rounded_rect(hdc, &seg_rect, accent, corner_r);
-            } else if percent_clamped <= seg_start {
-                draw_rounded_rect(hdc, &seg_rect, track, corner_r);
-            } else {
-                draw_rounded_rect(hdc, &seg_rect, track, corner_r);
-                let fraction = (percent_clamped - seg_start) / segment_percent;
-                let fill_width = (seg_w as f64 * fraction) as i32;
-                if fill_width > 0 {
-                    let fill_rect = RECT {
-                        left: seg_x,
-                        top: y,
-                        right: seg_x + fill_width,
-                        bottom: y + seg_h,
-                    };
-                    let rgn = CreateRoundRectRgn(
-                        seg_rect.left,
-                        seg_rect.top,
-                        seg_rect.right + 1,
-                        seg_rect.bottom + 1,
-                        corner_r * 2,
-                        corner_r * 2,
-                    );
-                    let _ = SelectClipRgn(hdc, rgn);
-                    let brush = CreateSolidBrush(COLORREF(accent.to_colorref()));
-                    FillRect(hdc, &fill_rect, brush);
-                    let _ = DeleteObject(brush);
-                    let _ = SelectClipRgn(hdc, HRGN::default());
-                    let _ = DeleteObject(rgn);
-                }
-            }
-        }
-
-        let text_x = bar_x + segment_count * (seg_w + seg_gap) - seg_gap + sc(BAR_RIGHT_MARGIN);
-        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
-        let mut text_rect = RECT {
-            left: text_x,
-            top: y,
-            right: text_x + sc(TEXT_WIDTH),
-            bottom: y + seg_h,
-        };
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        draw_nonempty_text(hdc, &mut text_wide, &mut text_rect);
     }
 }
 
