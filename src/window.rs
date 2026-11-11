@@ -1527,8 +1527,9 @@ const LEFT_DIVIDER_W: i32 = 3;
 const DIVIDER_RIGHT_MARGIN: i32 = 5;
 // Fits mixed labels at the 12px font size: seven 8px Latin/Cyrillic glyphs,
 // or the shorter labels containing 12px CJK glyphs. Scaled with the other columns.
+#[cfg(test)]
 const LABEL_WIDTH: i32 = 56;
-const LABEL_RIGHT_MARGIN: i32 = 9;
+const LABEL_RIGHT_MARGIN: i32 = crate::widget_layout::GROUP_GAP;
 const TEXT_WIDTH: i32 = crate::widget_layout::TEXT_WIDTH;
 const WIDGET_HEIGHT: i32 = 46;
 
@@ -2449,9 +2450,88 @@ fn total_widget_width_for(active_models: i32) -> i32 {
     sc(crate::widget_layout::layout(None, enabled, [false; 7]).width)
 }
 
+// Measure the same font and strings used by both render paths. Use the wider
+// of the two rows so the provider columns stay aligned, without 80px padding.
+fn measured_layout(state: &AppState, requested: Option<i32>) -> crate::widget_layout::Layout {
+    let mut widths = [0; 7];
+    let rows = [
+        (&state.session_text, &state.weekly_text),
+        (&state.codex_session_text, &state.codex_weekly_text),
+        (
+            &state.antigravity_session_text,
+            &state.antigravity_weekly_text,
+        ),
+        (
+            &state.antigravity_claude_session_text,
+            &state.antigravity_claude_weekly_text,
+        ),
+        (
+            &state.antigravity_argon_session_text,
+            &state.antigravity_argon_weekly_text,
+        ),
+        (&state.grok_session_text, &state.grok_weekly_text),
+        (&state.cursor_session_text, &state.cursor_weekly_text),
+    ];
+    let strings = state.language.strings();
+    let labels = [
+        top_window_label(
+            strings,
+            state.show_claude_code,
+            state.show_codex,
+            state.show_antigravity || state.show_antigravity_claude,
+        ),
+        bottom_window_label(strings, state.show_cursor),
+    ];
+    unsafe {
+        let dc = CreateCompatibleDC(HDC::default());
+        let face = native_interop::wide_str("Segoe UI");
+        let font = CreateFontW(
+            sc(-12),
+            0,
+            0,
+            0,
+            FW_MEDIUM.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_TT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+            PCWSTR::from_raw(face.as_ptr()),
+        );
+        let old = SelectObject(dc, font);
+        let measure = |text: &str| -> i32 {
+            if text.is_empty() {
+                return 0;
+            }
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let mut size = SIZE::default();
+            if !GetTextExtentPoint32W(dc, &wide, &mut size).as_bool() {
+                return TEXT_WIDTH;
+            }
+            (size.cx as f64 * 96.0 / CURRENT_DPI.load(Ordering::Relaxed) as f64).ceil() as i32
+        };
+        for (i, (top, bottom)) in rows.into_iter().enumerate() {
+            widths[i] = measure(top).max(measure(bottom));
+        }
+        let label_width = labels.into_iter().map(measure).max().unwrap_or(0);
+        SelectObject(dc, old);
+        let _ = DeleteObject(font);
+        let _ = DeleteDC(dc);
+        crate::widget_layout::layout_with_metrics(
+            requested,
+            enabled_models(state),
+            state.logo_modes,
+            widths,
+            label_width,
+        )
+    }
+}
+
 fn layout_for_state(state: &AppState) -> crate::widget_layout::Layout {
-    let initial =
-        crate::widget_layout::layout(state.widget_width, enabled_models(state), state.logo_modes);
+    let initial = measured_layout(state, state.widget_width);
     let limit = state.taskbar_hwnd.and_then(|hwnd| {
         native_interop::get_window_rect_safe(hwnd).map(|rect| {
             ((tray_left_for_taskbar(hwnd, rect) - rect.left).max(0) as f64 * 96.0
@@ -2460,9 +2540,7 @@ fn layout_for_state(state: &AppState) -> crate::widget_layout::Layout {
         })
     });
     match limit {
-        Some(max) if initial.width > max => {
-            crate::widget_layout::layout(Some(max), enabled_models(state), state.logo_modes)
-        }
+        Some(max) if initial.width > max => measured_layout(state, Some(max)),
         _ => initial,
     }
 }
@@ -2487,8 +2565,7 @@ fn adjust_widget_width(delta: i32) {
     {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
-            let minimum =
-                crate::widget_layout::layout(Some(0), enabled_models(s), s.logo_modes).width;
+            let minimum = measured_layout(s, Some(0)).width;
             let current = (total_widget_width_for_state(s) as f64 * 96.0
                 / CURRENT_DPI.load(Ordering::Relaxed) as f64)
                 .round() as i32;
@@ -3963,6 +4040,7 @@ unsafe extern "system" fn wnd_proc(
                 }
                 TIMER_COUNTDOWN => {
                     update_display();
+                    position_at_taskbar();
                     render_layered();
                     schedule_countdown_timer();
                 }
@@ -3991,6 +4069,7 @@ unsafe extern "system" fn wnd_proc(
         WM_APP_USAGE_UPDATED => {
             check_theme_change();
             check_language_change();
+            position_at_taskbar();
             render_layered();
             schedule_countdown_timer();
             suppress_tray_reposition_for(Duration::from_millis(
@@ -6424,11 +6503,11 @@ fn draw_row(
             &mut RECT {
                 left: x,
                 top: y,
-                right: x + sc(LABEL_WIDTH),
+                right: x + sc(layout.label_width),
                 bottom: y + sc(SEGMENT_H),
             },
         );
-        let mut column_x = x + sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN);
+        let mut column_x = x + sc(layout.label_width) + sc(LABEL_RIGHT_MARGIN);
         for i in 0..7 {
             if !enabled[i] {
                 continue;
@@ -6469,12 +6548,12 @@ fn draw_row(
                     &mut RECT {
                         left: column_x + visual_width,
                         top: y,
-                        right: column_x + visual_width + sc(TEXT_WIDTH),
+                        right: column_x + visual_width + sc(layout.text_widths[i]),
                         bottom: y + sc(SEGMENT_H),
                     },
                 );
             }
-            column_x += visual_width + sc(TEXT_WIDTH + crate::widget_layout::GAP);
+            column_x += visual_width + sc(layout.text_widths[i] + crate::widget_layout::GROUP_GAP);
         }
     }
 }
