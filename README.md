@@ -216,11 +216,17 @@ Notes:
 - Portable installs can update themselves by downloading the latest release from this fork
 - Proxies should be trusted because proxied usage requests include your OAuth bearer token inside the TLS connection
 
+## Compact width and provider logos
+
+Drag the grip at the widget's right edge to resize it. Percentages and reset times keep their text space while the graphical area shrinks: progress bars become provider logos, then disappear at the minimum width. The left grip still moves the widget. After clicking the resize grip, Left/Right arrows adjust width; the settings menu also has Narrower, Wider, and Reset width actions.
+
+Under **Settings → Appearance and width**, each provider/model has **Progress bars** and **Provider logo** choices. Width and these individual preferences are saved across restarts. At minimum width, all graphics are hidden while supported usage numbers remain visible. Logos are embedded locally; displaying them makes no network requests.
+
 ## Antigravity quota pools
 
 The model selector exposes three independent Antigravity choices: **Gemini Flash/Pro**, **Claude/GPT**, and **Gemini 4 Argon**. Gemini Flash/Pro and Claude/GPT each show five-hour and weekly quotas. Argon has a separate weekly quota and leaves the five-hour row empty. All three use the same Antigravity sign-in and one quota request per refresh.
 
-Antigravity row text explicitly shows **remaining** quota to match its usage panel. Bar fills and tray badges continue to represent **used** quota, consistent with the other providers and high-usage warning colors. Tray tooltips label this distinction. Existing Antigravity selections keep Gemini Flash/Pro enabled; the other pools can be enabled separately.
+Antigravity row numbers show quota remaining to match its usage panel, without an extra text label. Bar fills and tray badges continue to represent **used** quota, consistent with the other providers and high-usage warning colors. Tray tooltips label this distinction. Existing Antigravity selections keep Gemini Flash/Pro enabled; the other pools can be enabled separately.
 
 The monitor uses a pinned compatible Antigravity hub quota header: older client headers can silently omit Gemini and Argon pools. Missing pools stay unavailable; they never borrow another pool's quota. If the time-window quota endpoint is unavailable, the monitor reports a failure rather than interpreting ambiguous legacy model quotas as five-hour limits.
 
