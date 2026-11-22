@@ -21,13 +21,14 @@ use windows::Win32::UI::Controls::{
     CloseThemeData, GetThemeColor, OpenThemeData, DRAWITEMSTRUCT, MEASUREITEMSTRUCT,
     MENU_POPUPBACKGROUND, ODS_CHECKED, ODS_DISABLED, ODS_FOCUS, ODS_GRAYED, ODS_HOTLIGHT,
     ODS_NOFOCUSRECT, ODS_SELECTED, ODT_MENU, TMT_FILLCOLOR, NMHDR, NMTTDISPINFOW,
-    TOOLTIPS_CLASSW, TTDT_AUTOPOP, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_POP,
-    TTM_SETDELAYTIME, TTM_SETMAXTIPWIDTH, TTM_UPDATE, TTN_GETDISPINFOW, TTS_ALWAYSTIP,
-    TTS_NOPREFIX, TTTOOLINFOW,
+    TOOLTIPS_CLASSW, TTF_ABSOLUTE, TTF_IDISHWND, TTF_TRACK, TTM_ADDTOOLW,
+    TTM_SETMAXTIPWIDTH, TTM_TRACKACTIVATE, TTM_TRACKPOSITION, TTM_UPDATE, TTN_GETDISPINFOW,
+    TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, WM_MOUSEHOVER, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, SetFocus, VK_LEFT, VK_RIGHT,
+    ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_HOVER, TME_LEAVE,
+    TRACKMOUSEEVENT, VK_LEFT, VK_RIGHT,
 };
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -2556,6 +2557,8 @@ fn layout_for_state(state: &AppState) -> crate::widget_layout::Layout {
 }
 
 static TOOLTIP_HWND: AtomicIsize = AtomicIsize::new(0);
+/// `cbSize` the tooltip control accepted for this tool.
+static TOOLTIP_TOOL_SIZE: AtomicU32 = AtomicU32::new(0);
 /// Widget column under the cursor (provider index), or -1 for none.
 static HOVER_COLUMN: AtomicIsize = AtomicIsize::new(-1);
 
@@ -2588,26 +2591,39 @@ unsafe fn create_hover_tooltip(owner: HWND, hinstance: HINSTANCE) {
     };
     let mut tool = TTTOOLINFOW {
         cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
-        uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+        // A tracking tooltip: shown and hidden only by the widget. The stock
+        // automatic mode kept dismissing itself inside Explorer's taskbar.
+        uFlags: TTF_IDISHWND | TTF_TRACK | TTF_ABSOLUTE,
         hwnd: owner,
         uId: owner.0 as usize,
         // LPSTR_TEXTCALLBACKW: ask for the text with TTN_GETDISPINFOW.
         lpszText: PWSTR(-1isize as *mut u16),
         ..Default::default()
     };
-    SendMessageW(
+    let mut added = SendMessageW(
         tooltip,
         TTM_ADDTOOLW,
         WPARAM(0),
         LPARAM(&mut tool as *mut TTTOOLINFOW as isize),
     );
+    if added.0 == 0 {
+        // Without a Common Controls 6 manifest the tooltip control rejects the
+        // full struct; it accepts the size before `lpReserved` (TTTOOLINFOW_V2_SIZE).
+        tool.cbSize = std::mem::offset_of!(TTTOOLINFOW, lpReserved) as u32;
+        added = SendMessageW(
+            tooltip,
+            TTM_ADDTOOLW,
+            WPARAM(0),
+            LPARAM(&mut tool as *mut TTTOOLINFOW as isize),
+        );
+    }
+    diagnose::log(format!(
+        "hover tooltip created: tool added={} cbSize={}",
+        added.0 != 0,
+        tool.cbSize
+    ));
     SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, WPARAM(0), LPARAM(sc(460) as isize));
-    SendMessageW(
-        tooltip,
-        TTM_SETDELAYTIME,
-        WPARAM(TTDT_AUTOPOP as usize),
-        LPARAM(30_000),
-    );
+    TOOLTIP_TOOL_SIZE.store(tool.cbSize, Ordering::Relaxed);
     TOOLTIP_HWND.store(tooltip.0 as isize, Ordering::Relaxed);
 }
 
@@ -2639,7 +2655,7 @@ fn hover_column_at(
     None
 }
 
-fn update_hover_column(client_x: i32) {
+fn update_hover_column(hwnd: HWND, client_x: i32) {
     let column = {
         let state = lock_state();
         state.as_ref().and_then(|s| {
@@ -2662,18 +2678,127 @@ fn update_hover_column(client_x: i32) {
     if HOVER_COLUMN.swap(column, Ordering::Relaxed) == column {
         return;
     }
-    let tooltip = TOOLTIP_HWND.load(Ordering::Relaxed);
-    if tooltip == 0 {
-        return;
-    }
-    let tooltip = HWND(tooltip as *mut std::ffi::c_void);
-    unsafe {
-        // Hide the old provider's text; the next hover shows the new one.
-        SendMessageW(tooltip, TTM_POP, WPARAM(0), LPARAM(0));
-        if column >= 0 {
-            SendMessageW(tooltip, TTM_UPDATE, WPARAM(0), LPARAM(0));
+    hide_hover_tooltip();
+    if column >= 0 {
+        // Ask for WM_MOUSEHOVER (show) and WM_MOUSELEAVE (hide).
+        let mut track = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_HOVER | TME_LEAVE,
+            hwndTrack: hwnd,
+            dwHoverTime: 400,
+        };
+        unsafe {
+            let _ = TrackMouseEvent(&mut track);
         }
     }
+}
+
+fn hover_tool(hwnd: HWND) -> TTTOOLINFOW {
+    TTTOOLINFOW {
+        cbSize: TOOLTIP_TOOL_SIZE.load(Ordering::Relaxed),
+        hwnd,
+        uId: hwnd.0 as usize,
+        ..Default::default()
+    }
+}
+
+fn tooltip_hwnd() -> Option<HWND> {
+    let tooltip = TOOLTIP_HWND.load(Ordering::Relaxed);
+    (tooltip != 0).then(|| HWND(tooltip as *mut std::ffi::c_void))
+}
+
+/// Show the hovered column's details just above (or below) the widget.
+fn show_hover_tooltip(hwnd: HWND) {
+    let Some(tooltip) = tooltip_hwnd() else {
+        return;
+    };
+    if HOVER_COLUMN.load(Ordering::Relaxed) < 0 {
+        return;
+    }
+    let mut tool = hover_tool(hwnd);
+    let tool_ptr = LPARAM(&mut tool as *mut TTTOOLINFOW as isize);
+    unsafe {
+        let mut cursor = POINT::default();
+        let mut widget = RECT::default();
+        if GetCursorPos(&mut cursor).is_err() || GetWindowRect(hwnd, &mut widget).is_err() {
+            return;
+        }
+        // Show it first: the bubble only takes its real size once the text
+        // is fetched. Then move it above (or below) the widget.
+        SendMessageW(tooltip, TTM_UPDATE, WPARAM(0), LPARAM(0));
+        let track_position = |x: i32, y: i32| {
+            SendMessageW(
+                tooltip,
+                TTM_TRACKPOSITION,
+                WPARAM(0),
+                LPARAM(((y as u16 as isize) << 16) | (x as u16 as isize)),
+            );
+        };
+        track_position(cursor.x, widget.top);
+        SendMessageW(tooltip, TTM_TRACKACTIVATE, WPARAM(1), tool_ptr);
+        let mut bubble = RECT::default();
+        if GetWindowRect(tooltip, &mut bubble).is_err() {
+            return;
+        }
+        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let screen = if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            info.rcMonitor
+        } else {
+            widget
+        };
+        let (x, y) = hover_tooltip_position(
+            cursor.x,
+            widget,
+            screen,
+            bubble.right - bubble.left,
+            bubble.bottom - bubble.top,
+            sc(4),
+        );
+        track_position(x, y);
+    }
+}
+
+fn hide_hover_tooltip() {
+    let (Some(tooltip), Some(owner)) = (tooltip_hwnd(), main_hwnd()) else {
+        return;
+    };
+    let mut tool = hover_tool(owner);
+    unsafe {
+        SendMessageW(
+            tooltip,
+            TTM_TRACKACTIVATE,
+            WPARAM(0),
+            LPARAM(&mut tool as *mut TTTOOLINFOW as isize),
+        );
+    }
+}
+
+fn main_hwnd() -> Option<HWND> {
+    lock_state().as_ref().map(|s| s.hwnd.to_hwnd())
+}
+
+/// Top-left corner for a `width` x `height` bubble: centred on the cursor,
+/// above the widget when there is room on screen, otherwise below it, and
+/// kept inside the screen horizontally.
+fn hover_tooltip_position(
+    cursor_x: i32,
+    widget: RECT,
+    screen: RECT,
+    width: i32,
+    height: i32,
+    gap: i32,
+) -> (i32, i32) {
+    let x = (cursor_x - width / 2).clamp(screen.left, (screen.right - width).max(screen.left));
+    let y = if widget.top - gap - height >= screen.top {
+        widget.top - gap - height
+    } else {
+        widget.bottom + gap
+    };
+    (x, y)
 }
 
 /// Text for the hovered column, kept alive in a thread-local buffer that the
@@ -4334,7 +4459,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            update_hover_column((lparam.0 & 0xFFFF) as i16 as i32);
+            update_hover_column(hwnd, (lparam.0 & 0xFFFF) as i16 as i32);
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let resize = {
@@ -4872,6 +4997,15 @@ unsafe extern "system" fn wnd_proc(
             }
             tray_icon::remove_all(hwnd);
             PostQuitMessage(0);
+            LRESULT(0)
+        }
+        WM_MOUSEHOVER => {
+            show_hover_tooltip(hwnd);
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            HOVER_COLUMN.store(-1, Ordering::Relaxed);
+            hide_hover_tooltip();
             LRESULT(0)
         }
         WM_NOTIFY => {
@@ -6920,6 +7054,16 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 #[cfg(test)]
 mod hover_tests {
     use super::*;
+
+    #[test]
+    fn hover_tooltip_sits_above_bottom_taskbar_and_below_top_taskbar() {
+        let screen = RECT { left: -1920, top: 0, right: 0, bottom: 831 };
+        let bottom = RECT { left: -1920, top: 785, right: -1463, bottom: 831 };
+        assert_eq!(hover_tooltip_position(-1800, bottom, screen, 400, 100, 4), (-1920, 681));
+        assert_eq!(hover_tooltip_position(-100, bottom, screen, 400, 100, 4), (-400, 681));
+        let top = RECT { left: -1920, top: 0, right: -1463, bottom: 46 };
+        assert_eq!(hover_tooltip_position(-1500, top, screen, 400, 100, 4), (-1700, 50));
+    }
 
     #[test]
     fn hover_column_follows_drawn_provider_columns() {

@@ -11,7 +11,18 @@ fn main() {
         .set("FileVersion", version)
         .set("ProductVersion", version)
         .set_version_info(VersionInfo::FILEVERSION, numeric_version)
-        .set_version_info(VersionInfo::PRODUCTVERSION, numeric_version);
+        .set_version_info(VersionInfo::PRODUCTVERSION, numeric_version)
+        // Common Controls 6: the tooltip control in the legacy 5.82 library
+        // crashes on tracking tooltips.
+        .set_manifest(
+            r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+<dependency>
+<dependentAssembly>
+<assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+</dependentAssembly>
+</dependency>
+</assembly>"#,
+        );
 
     res.compile().expect("Failed to compile Windows resources");
 }
