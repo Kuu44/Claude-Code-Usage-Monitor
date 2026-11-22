@@ -87,6 +87,11 @@ fn window_lines(
         return vec![format!("{}: no data", window.label)];
     }
     let used = used.clamp(0.0, 100.0);
+    // A window with no reset time and nothing used has not started (or the
+    // plan has no such window); "100% left" would read as a real balance.
+    if used == 0.0 && window.section.resets_at.is_none() {
+        return vec![format!("{}: no active window", window.label)];
+    }
     let mut lines = vec![format!(
         "{}: {:.0}% used, {:.0}% left{}",
         window.label,
@@ -264,6 +269,16 @@ mod tests {
         assert!(!cursor.contains("Pace"));
         let codex = provider_details(1, Some(&data), &stats, now, &|_| "x".into());
         assert!(codex.contains("5-hour: no data"));
+        let idle = AppUsageData {
+            claude_code: Some(UsageData {
+                session: section(0.0, None),
+                weekly: section(7.0, Some(now + Duration::from_secs(3_600))),
+            }),
+            ..Default::default()
+        };
+        let claude = provider_details(0, Some(&idle), &stats, now, &|_| "x".into());
+        assert!(claude.contains("5-hour: no active window"));
+        assert!(!claude.contains("100% left"));
         assert!(!codex.contains("Cost"));
     }
 }
