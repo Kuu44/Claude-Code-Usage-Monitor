@@ -42,6 +42,9 @@ static ANTIGRAVITY_TOKEN_CACHE: Mutex<Option<CachedAccessToken>> = Mutex::new(No
 const ANTIGRAVITY_REFRESH_MARGIN: Duration = Duration::from_secs(60);
 const ANTIGRAVITY_DEFAULT_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 const ANTIGRAVITY_CLIENT_FILE_ENV: &str = "CLAUDE_USAGE_MONITOR_ANTIGRAVITY_OAUTH_CLIENT_FILE";
+/// Codex sign-in fingerprint seen after an app-server read that failed; the
+/// app-server is not started again until the sign-in changes.
+static FAILED_CODEX_REFRESH: Mutex<Option<u64>> = Mutex::new(None);
 static FAILED_CLAUDE_REFRESHES: Mutex<Vec<(String, ClaudeRefreshKey)>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +103,41 @@ struct CodexAuthFile {
 struct CodexTokenData {
     access_token: String,
     account_id: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+impl CodexTokenData {
+    /// Changes whenever Codex refreshes or replaces its sign-in. Never logged.
+    fn sign_in_fingerprint(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.access_token.hash(&mut hasher);
+        self.refresh_token.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+/// `account/rateLimits/read` result from `codex app-server`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerRateLimits {
+    rate_limits: Option<CodexAppServerSnapshot>,
+    rate_limits_by_limit_id: Option<BTreeMap<String, CodexAppServerSnapshot>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerSnapshot {
+    primary: Option<CodexAppServerWindow>,
+    secondary: Option<CodexAppServerWindow>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerWindow {
+    used_percent: f64,
+    window_duration_mins: Option<i64>,
+    resets_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -434,14 +472,37 @@ fn poll_codex() -> Result<UsageData, PollError> {
     };
 
     match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
-        Ok(data) => Ok(data),
         Err(PollError::AuthRequired) => {
-            cli_refresh_codex_token();
-            let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
-            fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())
+            let sign_in = creds.sign_in_fingerprint();
+            let last_failed = FAILED_CODEX_REFRESH.lock().ok().and_then(|failed| *failed);
+            if !codex_refresh_allowed(last_failed, sign_in) {
+                diagnose::log(
+                    "skipping Codex app-server read: last attempt failed and the sign-in has not changed",
+                );
+                return Err(PollError::TokenExpired);
+            }
+            // The Codex binary refreshes its own sign-in when it needs to, and
+            // reading rate limits runs no model turn and saves no session.
+            match codex_app_server_rate_limits() {
+                Some(data) => Ok(data),
+                None => {
+                    let after = read_codex_credentials()
+                        .map(|creds| creds.sign_in_fingerprint())
+                        .unwrap_or(sign_in);
+                    if let Ok(mut failed) = FAILED_CODEX_REFRESH.lock() {
+                        *failed = Some(after);
+                    }
+                    Err(PollError::TokenExpired)
+                }
+            }
         }
-        Err(error) => Err(error),
+        result => result,
     }
+}
+
+/// After a failed app-server read, wait for Codex's sign-in to change.
+fn codex_refresh_allowed(last_failed: Option<u64>, current: u64) -> bool {
+    last_failed != Some(current)
 }
 
 fn poll_antigravity() -> Result<AntigravityUsage, PollError> {
@@ -744,48 +805,129 @@ fn cli_refresh_wsl_token(distro: &str, mode: ClaudeRefreshMode) {
     wait_for_refresh(&mut child);
 }
 
-fn cli_refresh_codex_token() {
+/// Read Codex rate limits from a short-lived `codex app-server` (JSON-RPC over
+/// stdio), the way T3 Code does. Returns None if Codex cannot answer.
+fn codex_app_server_rate_limits() -> Option<UsageData> {
+    use std::io::{BufRead, BufReader, Write};
+
     let codex_path = resolve_windows_codex_path();
-    let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
-    let is_ps1 = codex_path.to_lowercase().ends_with(".ps1");
-    diagnose::log(format!(
-        "attempting Windows Codex token refresh via {codex_path}"
-    ));
-
-    let args: &[&str] = &["exec", "."];
-
-    let mut cmd = if is_cmd {
+    let lower = codex_path.to_lowercase();
+    diagnose::log(format!("reading Codex rate limits via {codex_path} app-server"));
+    let mut cmd = if lower.ends_with(".cmd") {
         let mut c = Command::new("cmd.exe");
-        c.arg("/c").arg(&codex_path).args(args);
+        c.arg("/c").arg(&codex_path).arg("app-server");
         c
-    } else if is_ps1 {
+    } else if lower.ends_with(".ps1") {
         let mut c = Command::new("powershell.exe");
-        c.arg("-NoProfile")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-File")
+        c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(&codex_path)
-            .args(args);
+            .arg("app-server");
         c
     } else {
         let mut c = Command::new(&codex_path);
-        c.args(args);
+        c.arg("app-server");
         c
     };
-    cmd.creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+    cmd.current_dir(claude_refresh_working_dir())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
 
     let mut child = match cmd.spawn() {
-        Ok(c) => c,
+        Ok(child) => child,
         Err(error) => {
-            diagnose::log_error("unable to spawn Windows Codex token refresh", error);
-            return;
+            diagnose::log_error("unable to start codex app-server", error);
+            return None;
         }
     };
+    let mut stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"claude-code-usage-monitor","version":"1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"initialized"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"account/rateLimits/read"}"#,
+        "\n"
+    );
+    let written = stdin
+        .write_all(requests.as_bytes())
+        .and_then(|_| stdin.flush());
 
-    wait_for_refresh(&mut child);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(answer) = codex_usage_from_app_server_line(&line) {
+                let _ = sender.send(answer);
+                return;
+            }
+        }
+    });
+    let answer = if written.is_ok() {
+        receiver.recv_timeout(Duration::from_secs(20)).ok().flatten()
+    } else {
+        None
+    };
+
+    // Closing stdin ends the app-server; kill the process tree if it lingers.
+    drop(stdin);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if matches!(child.try_wait(), Ok(None)) {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+
+    if answer.is_none() {
+        diagnose::log("codex app-server did not return rate limits");
+    }
+    answer
+}
+
+/// The answer to request 2, if `line` is it: Some(Some(data)) on success,
+/// Some(None) on an error reply, None for any other line.
+fn codex_usage_from_app_server_line(line: &str) -> Option<Option<UsageData>> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("id").and_then(serde_json::Value::as_i64) != Some(2) {
+        return None;
+    }
+    let Some(result) = value.get("result") else {
+        return Some(None);
+    };
+    let limits: CodexAppServerRateLimits = match serde_json::from_value(result.clone()) {
+        Ok(limits) => limits,
+        Err(_) => return Some(None),
+    };
+    let snapshot = limits
+        .rate_limits_by_limit_id
+        .and_then(|mut by_id| by_id.remove("codex"))
+        .or(limits.rate_limits);
+    let Some(snapshot) = snapshot else {
+        return Some(None);
+    };
+    let window = |w: CodexAppServerWindow| {
+        Some(Box::new(CodexRateLimitWindow {
+            used_percent: w.used_percent,
+            reset_at: w.resets_at.unwrap_or(0),
+            limit_window_seconds: None,
+            window_minutes: w.window_duration_mins,
+        }))
+    };
+    Some(codex_usage_from_response(CodexUsageResponse {
+        rate_limit: Some(Some(Box::new(CodexRateLimitDetails {
+            primary_window: Some(snapshot.primary.and_then(window)),
+            secondary_window: Some(snapshot.secondary.and_then(window)),
+        }))),
+    }))
 }
 
 /// Spawn a command and wait up to `timeout` for it to finish.
@@ -1794,6 +1936,10 @@ fn codex_auth_path() -> Option<PathBuf> {
 }
 
 fn codex_credential_watch_signature() -> String {
+    // Watch the sign-in itself, not the file's size and mtime.
+    if let Some(creds) = read_codex_credentials() {
+        return format!("codex|signin|{:x}", creds.sign_in_fingerprint());
+    }
     credential_file_watch_signature("codex", codex_auth_path())
 }
 
@@ -2598,6 +2744,55 @@ mod tests {
         let access = resolve_antigravity_access(&creds, now);
         assert_eq!(access.access_token, "stored");
         assert!(access.project.is_none());
+    }
+
+    #[test]
+    fn codex_breaker_waits_for_a_new_sign_in() {
+        assert!(codex_refresh_allowed(None, 7));
+        assert!(!codex_refresh_allowed(Some(7), 7));
+        assert!(codex_refresh_allowed(Some(7), 8));
+        let token = |access: &str, refresh: Option<&str>| CodexTokenData {
+            access_token: access.into(),
+            account_id: None,
+            refresh_token: refresh.map(Into::into),
+        };
+        let a = token("a", Some("r")).sign_in_fingerprint();
+        assert_eq!(a, token("a", Some("r")).sign_in_fingerprint());
+        assert_ne!(a, token("b", Some("r")).sign_in_fingerprint());
+        assert_ne!(a, token("a", Some("r2")).sign_in_fingerprint());
+    }
+
+    /// Live, read-only: starts `codex app-server` and reads rate limits.
+    #[test]
+    #[ignore]
+    fn codex_app_server_live_read() {
+        let started = std::time::Instant::now();
+        let usage = codex_app_server_rate_limits().expect("rate limits");
+        println!(
+            "session {}% weekly {}% in {:?}",
+            usage.session.percentage, usage.weekly.percentage, started.elapsed()
+        );
+    }
+
+    #[test]
+    fn codex_app_server_rate_limits_map_by_window_length() {
+        let reply = r#"{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":87,"windowDurationMins":10080,"resetsAt":1795540551},"secondary":null,"planType":"prolite"},"rateLimitsByLimitId":{"codex":{"limitId":"codex","primary":{"usedPercent":87,"windowDurationMins":10080,"resetsAt":1795540551},"secondary":null}}}}"#;
+        let usage = codex_usage_from_app_server_line(reply).unwrap().unwrap();
+        assert_eq!(usage.weekly.percentage, 87.0);
+        assert!(usage.weekly.resets_at.is_some());
+        assert!(usage.session.resets_at.is_none());
+
+        let both = r#"{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":1795540551},"secondary":{"usedPercent":40,"windowDurationMins":10080,"resetsAt":1795540999}}}}"#;
+        let usage = codex_usage_from_app_server_line(both).unwrap().unwrap();
+        assert_eq!((usage.session.percentage, usage.weekly.percentage), (12.0, 40.0));
+
+        assert_eq!(
+            codex_usage_from_app_server_line(r#"{"id":2,"error":{"code":-32000,"message":"auth"}}"#)
+                .map(|answer| answer.is_none()),
+            Some(true)
+        );
+        assert!(codex_usage_from_app_server_line(r#"{"id":1,"result":{}}"#).is_none());
+        assert!(codex_usage_from_app_server_line("not json").is_none());
     }
 
     #[test]
