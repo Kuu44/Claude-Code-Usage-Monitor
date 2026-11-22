@@ -2704,7 +2704,7 @@ fn hover_tool(hwnd: HWND) -> TTTOOLINFOW {
 
 fn tooltip_hwnd() -> Option<HWND> {
     let tooltip = TOOLTIP_HWND.load(Ordering::Relaxed);
-    (tooltip != 0).then(|| HWND(tooltip as *mut std::ffi::c_void))
+    (tooltip != 0).then_some(HWND(tooltip as *mut std::ffi::c_void))
 }
 
 /// Show the hovered column's details just above (or below) the widget.

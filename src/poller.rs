@@ -719,23 +719,23 @@ fn unix_now_millis() -> i64 {
 fn refresh_claude_source(
     source: &CredentialSource,
 ) -> Result<Credentials, Option<ClaudeRefreshKey>> {
-    let mut after = None;
-    for mode in [ClaudeRefreshMode::AuthStatus] {
-        cli_refresh_token(source, mode);
-        match read_credentials_from_source(source) {
-            Some(refreshed) if !is_token_expired(refreshed.expires_at) => return Ok(refreshed),
-            Some(refreshed) => {
-                diagnose::log(format!(
-                    "credentials from {source:?} still expired after {mode:?} refresh"
-                ));
-                after = Some(refreshed.refresh_key());
-            }
-            None => diagnose::log(format!(
+    let mode = ClaudeRefreshMode::AuthStatus;
+    cli_refresh_token(source, mode);
+    match read_credentials_from_source(source) {
+        Some(refreshed) if !is_token_expired(refreshed.expires_at) => Ok(refreshed),
+        Some(refreshed) => {
+            diagnose::log(format!(
+                "credentials from {source:?} still expired after {mode:?} refresh"
+            ));
+            Err(Some(refreshed.refresh_key()))
+        }
+        None => {
+            diagnose::log(format!(
                 "credentials from {source:?} unavailable after {mode:?} refresh"
-            )),
+            ));
+            Err(None)
         }
     }
-    Err(after)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
