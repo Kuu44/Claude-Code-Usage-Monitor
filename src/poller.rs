@@ -5,6 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -32,6 +33,10 @@ const PROVIDER_CLIENT_VERSION: &str =
 
 const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-3-haiku-20240307", "claude-haiku-4-5-20251001"];
 static CURSOR_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Credential state seen right after a CLI refresh that left the token expired,
+/// per credential source. While the stored refresh token and expiry stay the
+/// same, the CLI is not called again (see `claude_refresh_decision`).
+static FAILED_CLAUDE_REFRESHES: Mutex<Vec<(String, ClaudeRefreshKey)>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PollError {
@@ -430,15 +435,35 @@ fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError>
         }
 
         let source = creds.source.clone();
-        cli_refresh_token(&source);
+        let source_key = format!("{source:?}");
+        let decision = claude_refresh_decision(
+            failed_claude_refresh(&source_key),
+            creds.refresh_key(),
+            creds.refresh_expires_at,
+            unix_now_millis(),
+        );
 
-        match read_credentials_from_source(&source) {
-            Some(refreshed) if !is_token_expired(refreshed.expires_at) => return Ok(refreshed),
-            Some(_) => diagnose::log(format!(
-                "credentials from {source:?} still expired after refresh attempt"
+        match decision {
+            ClaudeRefreshDecision::Attempt => match refresh_claude_source(&source) {
+                Ok(refreshed) => {
+                    clear_failed_claude_refresh(&source_key);
+                    return Ok(refreshed);
+                }
+                Err(after) => {
+                    // Remember the credentials as they were after the failed
+                    // attempt; only a new sign-in (new refresh token or expiry)
+                    // re-arms the CLI refresh for this source.
+                    record_failed_claude_refresh(
+                        &source_key,
+                        after.unwrap_or_else(|| creds.refresh_key()),
+                    );
+                }
+            },
+            ClaudeRefreshDecision::SkipRefreshTokenExpired => diagnose::log(format!(
+                "skipping Claude CLI refresh for {source:?}: refresh token expired, sign-in required"
             )),
-            None => diagnose::log(format!(
-                "credentials from {source:?} unavailable after refresh attempt"
+            ClaudeRefreshDecision::SkipAfterFailedAttempt => diagnose::log(format!(
+                "skipping Claude CLI refresh for {source:?}: last attempt failed and the sign-in has not changed"
             )),
         }
 
@@ -449,23 +474,161 @@ fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError>
     }
 }
 
-/// Invoke the Claude CLI with a minimal prompt to force its internal
-/// OAuth token refresh.
-fn cli_refresh_token(source: &CredentialSource) {
-    match source {
-        CredentialSource::Windows(_) => cli_refresh_windows_token(),
-        CredentialSource::Wsl { distro } => cli_refresh_wsl_token(distro),
+/// Identity of the stored Claude sign-in, used by the refresh circuit breaker.
+/// Holds a hash of the refresh token, never the token itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClaudeRefreshKey {
+    refresh_fingerprint: Option<u64>,
+    expires_at: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaudeRefreshDecision {
+    Attempt,
+    SkipRefreshTokenExpired,
+    SkipAfterFailedAttempt,
+}
+
+/// Decide whether an expired Claude token may be refreshed through the CLI.
+///
+/// After one attempt leaves the token expired, the CLI is not called again until
+/// the refresh token or `expiresAt` changes. File size and mtime are not enough:
+/// a failed refresh, and MCP sign-ins stored in the same file, rewrite it too.
+fn claude_refresh_decision(
+    last_failed: Option<ClaudeRefreshKey>,
+    current: ClaudeRefreshKey,
+    refresh_expires_at: Option<i64>,
+    now_millis: i64,
+) -> ClaudeRefreshDecision {
+    if refresh_expires_at.is_some_and(|expires| now_millis >= expires) {
+        return ClaudeRefreshDecision::SkipRefreshTokenExpired;
+    }
+    if last_failed == Some(current) {
+        return ClaudeRefreshDecision::SkipAfterFailedAttempt;
+    }
+    ClaudeRefreshDecision::Attempt
+}
+
+fn failed_claude_refresh(source_key: &str) -> Option<ClaudeRefreshKey> {
+    let failures = FAILED_CLAUDE_REFRESHES.lock().ok()?;
+    failures
+        .iter()
+        .find(|(key, _)| key == source_key)
+        .map(|(_, refresh_key)| *refresh_key)
+}
+
+fn record_failed_claude_refresh(source_key: &str, refresh_key: ClaudeRefreshKey) {
+    if let Ok(mut failures) = FAILED_CLAUDE_REFRESHES.lock() {
+        failures.retain(|(key, _)| key != source_key);
+        failures.push((source_key.to_string(), refresh_key));
     }
 }
 
-fn cli_refresh_windows_token() {
+fn clear_failed_claude_refresh(source_key: &str) {
+    if let Ok(mut failures) = FAILED_CLAUDE_REFRESHES.lock() {
+        failures.retain(|(key, _)| key != source_key);
+    }
+}
+
+fn unix_now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+/// Refresh an expired Claude token through the CLI. Returns the refreshed
+/// credentials, or the refresh key read after the failed attempt (if readable).
+///
+/// `claude auth status` refreshes an expired OAuth token without a model call
+/// and without saving a session. A CLI that does not refresh there gets one
+/// minimal print-mode request with session saving, MCP servers, user settings
+/// (and so user hooks) and tools turned off.
+fn refresh_claude_source(
+    source: &CredentialSource,
+) -> Result<Credentials, Option<ClaudeRefreshKey>> {
+    let mut after = None;
+    for mode in [ClaudeRefreshMode::AuthStatus, ClaudeRefreshMode::MinimalPrompt] {
+        cli_refresh_token(source, mode);
+        match read_credentials_from_source(source) {
+            Some(refreshed) if !is_token_expired(refreshed.expires_at) => return Ok(refreshed),
+            Some(refreshed) => {
+                diagnose::log(format!(
+                    "credentials from {source:?} still expired after {mode:?} refresh"
+                ));
+                after = Some(refreshed.refresh_key());
+            }
+            None => diagnose::log(format!(
+                "credentials from {source:?} unavailable after {mode:?} refresh"
+            )),
+        }
+    }
+    Err(after)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaudeRefreshMode {
+    AuthStatus,
+    MinimalPrompt,
+}
+
+impl ClaudeRefreshMode {
+    fn cli_args(self) -> &'static [&'static str] {
+        match self {
+            Self::AuthStatus => &["auth", "status", "--json"],
+            Self::MinimalPrompt => &[
+                "-p",
+                ".",
+                "--model",
+                "haiku",
+                "--no-session-persistence",
+                "--strict-mcp-config",
+                "--setting-sources",
+                "project",
+                "--tools",
+                "",
+            ],
+        }
+    }
+
+    fn shell_args(self) -> &'static str {
+        match self {
+            Self::AuthStatus => "auth status --json",
+            Self::MinimalPrompt => {
+                "-p . --model haiku --no-session-persistence --strict-mcp-config --setting-sources project --tools ''"
+            }
+        }
+    }
+}
+
+fn cli_refresh_token(source: &CredentialSource, mode: ClaudeRefreshMode) {
+    match source {
+        CredentialSource::Windows(_) => cli_refresh_windows_token(mode),
+        CredentialSource::Wsl { distro } => cli_refresh_wsl_token(distro, mode),
+    }
+}
+
+/// Working directory for CLI refresh children. A Run-key launch inherits
+/// `C:\WINDOWS\system32`; without this, any session the CLI saves lands there.
+fn claude_refresh_working_dir() -> PathBuf {
+    if let Some(dir) =
+        dirs::data_local_dir().map(|dir| dir.join("ClaudeCodeUsageMonitor").join("refresh"))
+    {
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return dir;
+        }
+    }
+    std::env::temp_dir()
+}
+
+fn cli_refresh_windows_token(mode: ClaudeRefreshMode) {
     let claude_path = resolve_windows_claude_path();
     let is_cmd = claude_path.to_lowercase().ends_with(".cmd");
     diagnose::log(format!(
-        "attempting Windows Claude token refresh via {claude_path}"
+        "attempting Windows Claude token refresh ({mode:?}) via {claude_path}"
     ));
 
-    let args: &[&str] = &["-p", "."];
+    let args = mode.cli_args();
 
     let mut cmd = if is_cmd {
         let mut c = Command::new("cmd.exe");
@@ -476,7 +639,8 @@ fn cli_refresh_windows_token() {
         c.args(args);
         c
     };
-    cmd.env_remove("CLAUDECODE")
+    cmd.current_dir(claude_refresh_working_dir())
+        .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
@@ -491,34 +655,31 @@ fn cli_refresh_windows_token() {
         }
     };
 
-    // Wait up to 30 seconds — don't block the poll thread forever
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() > Duration::from_secs(30) {
-                    let _ = child.kill();
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(_) => break,
-        }
-    }
+    wait_for_refresh(&mut child);
 }
 
-fn cli_refresh_wsl_token(distro: &str) {
+fn wsl_refresh_script(mode: ClaudeRefreshMode) -> String {
+    format!(
+        "d=\"$HOME/.cache/claude-code-usage-monitor/refresh\"; mkdir -p \"$d\" && cd \"$d\" || exit 1; \
+         if command -v claude >/dev/null 2>&1; then c=claude; \
+         elif [ -x \"$HOME/.local/bin/claude\" ]; then c=\"$HOME/.local/bin/claude\"; \
+         else exit 127; fi; \"$c\" {}",
+        mode.shell_args()
+    )
+}
+
+fn cli_refresh_wsl_token(distro: &str, mode: ClaudeRefreshMode) {
     diagnose::log(format!(
-        "attempting WSL Claude token refresh in distro {distro}"
+        "attempting WSL Claude token refresh ({mode:?}) in distro {distro}"
     ));
     let mut cmd = Command::new("wsl.exe");
-    cmd.arg("-d")
+    cmd.current_dir(claude_refresh_working_dir())
+        .arg("-d")
         .arg(distro)
         .arg("--")
         .arg("bash")
-        .arg("-lic")
-        .arg("if command -v claude >/dev/null 2>&1; then claude -p .; elif [ -x \"$HOME/.local/bin/claude\" ]; then \"$HOME/.local/bin/claude\" -p .; else exit 127; fi")
+        .arg("-lc")
+        .arg(wsl_refresh_script(mode))
         .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .creation_flags(CREATE_NO_WINDOW)
@@ -763,6 +924,14 @@ fn credential_watch_signature(source: &CredentialSource) -> Option<String> {
 
 fn windows_credential_watch_signature(path: &PathBuf) -> String {
     let key = format!("win:{}", path.display());
+    // Watch the Claude sign-in itself. MCP server sign-ins share this file and
+    // rewrite it often, which would wake an auth-paused poll for nothing.
+    if let Some(creds) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| parse_credentials(&content, CredentialSource::Windows(path.clone())))
+    {
+        return claude_sign_in_signature(&key, creds.refresh_key());
+    }
     match std::fs::metadata(path) {
         Ok(metadata) => {
             let modified = metadata
@@ -775,6 +944,14 @@ fn windows_credential_watch_signature(path: &PathBuf) -> String {
         }
         Err(_) => format!("{key}|missing"),
     }
+}
+
+fn claude_sign_in_signature(key: &str, refresh_key: ClaudeRefreshKey) -> String {
+    format!(
+        "{key}|oauth|{:x}|{}",
+        refresh_key.refresh_fingerprint.unwrap_or(0),
+        refresh_key.expires_at.unwrap_or(0)
+    )
 }
 
 fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
@@ -1482,7 +1659,25 @@ fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
 struct Credentials {
     access_token: String,
     expires_at: Option<i64>,
+    refresh_fingerprint: Option<u64>,
+    refresh_expires_at: Option<i64>,
     source: CredentialSource,
+}
+
+impl Credentials {
+    fn refresh_key(&self) -> ClaudeRefreshKey {
+        ClaudeRefreshKey {
+            refresh_fingerprint: self.refresh_fingerprint,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+/// In-memory fingerprint of a secret, for change detection only. Never logged.
+fn token_fingerprint(token: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    token.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Clone, Debug)]
@@ -1742,10 +1937,18 @@ fn parse_credentials(content: &str, source: CredentialSource) -> Option<Credenti
         .and_then(|v| v.as_str())?
         .to_string();
     let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64());
+    let refresh_fingerprint = oauth
+        .get("refreshToken")
+        .and_then(|v| v.as_str())
+        .filter(|token| !token.is_empty())
+        .map(token_fingerprint);
+    let refresh_expires_at = oauth.get("refreshTokenExpiresAt").and_then(|v| v.as_i64());
 
     Some(Credentials {
         access_token,
         expires_at,
+        refresh_fingerprint,
+        refresh_expires_at,
         source,
     })
 }
@@ -2044,6 +2247,87 @@ pub fn app_is_past_reset(data: &AppUsageData) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NOW: i64 = 1_800_000_000_000;
+
+    fn refresh_key(fingerprint: u64, expires_at: i64) -> ClaudeRefreshKey {
+        ClaudeRefreshKey {
+            refresh_fingerprint: Some(fingerprint),
+            expires_at: Some(expires_at),
+        }
+    }
+
+    #[test]
+    fn claude_refresh_breaker_attempts_first_refresh() {
+        let current = refresh_key(1, NOW - 1_000);
+        assert_eq!(
+            claude_refresh_decision(None, current, Some(NOW + 86_400_000), NOW),
+            ClaudeRefreshDecision::Attempt
+        );
+    }
+
+    #[test]
+    fn claude_refresh_breaker_skips_unchanged_sign_in_after_failure() {
+        let current = refresh_key(1, NOW - 1_000);
+        assert_eq!(
+            claude_refresh_decision(Some(current), current, None, NOW),
+            ClaudeRefreshDecision::SkipAfterFailedAttempt
+        );
+    }
+
+    #[test]
+    fn claude_refresh_breaker_rearms_on_new_refresh_token_or_expiry() {
+        let failed = refresh_key(1, NOW - 1_000);
+        assert_eq!(
+            claude_refresh_decision(Some(failed), refresh_key(2, NOW - 1_000), None, NOW),
+            ClaudeRefreshDecision::Attempt
+        );
+        assert_eq!(
+            claude_refresh_decision(Some(failed), refresh_key(1, NOW - 500), None, NOW),
+            ClaudeRefreshDecision::Attempt
+        );
+    }
+
+    #[test]
+    fn claude_refresh_breaker_skips_expired_refresh_token() {
+        assert_eq!(
+            claude_refresh_decision(None, refresh_key(1, NOW - 1_000), Some(NOW - 1), NOW),
+            ClaudeRefreshDecision::SkipRefreshTokenExpired
+        );
+    }
+
+    #[test]
+    fn claude_sign_in_signature_ignores_mcp_entries_and_hides_tokens() {
+        let base = r#"{"claudeAiOauth":{"accessToken":"secret-access","refreshToken":"secret-refresh","expiresAt":1800000000000,"refreshTokenExpiresAt":1900000000000},"mcpOAuth":{"x":{"accessToken":"a"}}}"#;
+        let changed_mcp = r#"{"claudeAiOauth":{"accessToken":"secret-access","refreshToken":"secret-refresh","expiresAt":1800000000000,"refreshTokenExpiresAt":1900000000000},"mcpOAuth":{"x":{"accessToken":"bbbbbbbb"}}}"#;
+        let new_sign_in = r#"{"claudeAiOauth":{"accessToken":"secret-access-2","refreshToken":"secret-refresh-2","expiresAt":1800000999000}}"#;
+        let source = || CredentialSource::Windows(PathBuf::from("c"));
+        let sig = |content: &str| {
+            claude_sign_in_signature("win:c", parse_credentials(content, source()).unwrap().refresh_key())
+        };
+
+        assert_eq!(sig(base), sig(changed_mcp));
+        assert_ne!(sig(base), sig(new_sign_in));
+        assert!(!sig(base).contains("secret"));
+        let creds = parse_credentials(base, source()).unwrap();
+        assert_eq!(creds.refresh_expires_at, Some(1_900_000_000_000));
+    }
+
+    #[test]
+    fn claude_refresh_never_runs_a_full_default_session() {
+        assert_eq!(ClaudeRefreshMode::AuthStatus.cli_args(), &["auth", "status", "--json"]);
+        let prompt = ClaudeRefreshMode::MinimalPrompt.cli_args();
+        for flag in ["--no-session-persistence", "--strict-mcp-config", "--model"] {
+            assert!(prompt.contains(&flag), "missing {flag}");
+        }
+        let script = wsl_refresh_script(ClaudeRefreshMode::AuthStatus);
+        assert!(script.contains("cd \"$d\""));
+        assert!(script.ends_with("auth status --json"));
+        assert!(!claude_refresh_working_dir()
+            .to_string_lossy()
+            .to_lowercase()
+            .contains("system32"));
+    }
 
     fn usage_with_session_percent(percentage: f64) -> UsageData {
         UsageData {
