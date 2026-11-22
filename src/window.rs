@@ -429,6 +429,10 @@ struct SettingsFile {
     show_grok: bool,
     #[serde(default)]
     show_cursor: bool,
+    /// Optional path to an OAuth client file for refreshing the Antigravity
+    /// sign-in (read by the poller; kept here so saving settings preserves it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    antigravity_oauth_client_file: Option<String>,
 }
 
 impl Default for SettingsFile {
@@ -450,6 +454,7 @@ impl Default for SettingsFile {
             show_antigravity_argon: false,
             show_grok: false,
             show_cursor: false,
+            antigravity_oauth_client_file: None,
         }
     }
 }
@@ -529,6 +534,7 @@ fn save_state_settings() {
             show_antigravity_argon: s.show_antigravity_argon,
             show_grok: s.show_grok,
             show_cursor: s.show_cursor,
+            antigravity_oauth_client_file: load_settings().antigravity_oauth_client_file,
         });
     }
 }

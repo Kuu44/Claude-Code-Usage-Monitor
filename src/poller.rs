@@ -36,6 +36,12 @@ static CURSOR_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Credential state seen right after a CLI refresh that left the token expired,
 /// per credential source. While the stored refresh token and expiry stay the
 /// same, the CLI is not called again (see `claude_refresh_decision`).
+/// Antigravity access token refreshed in this process. Kept in memory only:
+/// `agy` owns the Credential Manager entry and nothing is written back.
+static ANTIGRAVITY_TOKEN_CACHE: Mutex<Option<CachedAccessToken>> = Mutex::new(None);
+const ANTIGRAVITY_REFRESH_MARGIN: Duration = Duration::from_secs(60);
+const ANTIGRAVITY_DEFAULT_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
+const ANTIGRAVITY_CLIENT_FILE_ENV: &str = "CLAUDE_USAGE_MONITOR_ANTIGRAVITY_OAUTH_CLIENT_FILE";
 static FAILED_CLAUDE_REFRESHES: Mutex<Vec<(String, ClaudeRefreshKey)>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +129,45 @@ struct AntigravityAuthFile {
 #[derive(Deserialize)]
 struct AntigravityTokenData {
     access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expiry: Option<String>,
+}
+
+/// OAuth installed-app client used to refresh the `agy` sign-in, read from a
+/// local file (never stored in this repository). T3 Code's
+/// `antigravity-acp/acp_token.json` has this shape.
+#[derive(Clone, Deserialize)]
+struct AntigravityOAuthClient {
+    client_id: String,
+    client_secret: String,
+    #[serde(default)]
+    token_uri: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GoogleTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+#[derive(Clone)]
+struct CachedAccessToken {
+    refresh_fingerprint: u64,
+    access_token: String,
+    expires_at: SystemTime,
+}
+
+/// Token and optional project to use for one Antigravity poll.
+struct AntigravityAccess {
+    access_token: String,
+    project: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -408,7 +453,8 @@ fn poll_antigravity() -> Result<AntigravityUsage, PollError> {
         }
     };
 
-    let data = fetch_antigravity_usage(&creds.access_token)?;
+    let access = resolve_antigravity_access(&creds, SystemTime::now());
+    let data = fetch_antigravity_usage(&access.access_token, access.project.as_deref())?;
     diagnose::log(format!(
         "Antigravity quota pools: Gemini={}, Claude/GPT={}, Argon={}",
         data.gemini.is_some(),
@@ -1430,12 +1476,15 @@ fn antigravity_user_agent() -> &'static str {
     "antigravity/hub/2.24.0 (aidev_client; os_type=windows; arch=amd64; cl=963137146)"
 }
 
-fn fetch_antigravity_usage(token: &str) -> Result<AntigravityUsage, PollError> {
+fn fetch_antigravity_usage(
+    token: &str,
+    project_hint: Option<&str>,
+) -> Result<AntigravityUsage, PollError> {
     let mut auth_error = false;
     let mut last_error = PollError::RequestFailed;
 
     for base_url in ANTIGRAVITY_ENDPOINTS {
-        match fetch_antigravity_usage_from_endpoint(base_url, token) {
+        match fetch_antigravity_usage_from_endpoint(base_url, token, project_hint) {
             Ok(data) => return Ok(data),
             Err(PollError::AuthRequired) => auth_error = true,
             Err(error) => last_error = error,
@@ -1452,8 +1501,12 @@ fn fetch_antigravity_usage(token: &str) -> Result<AntigravityUsage, PollError> {
 fn fetch_antigravity_usage_from_endpoint(
     base_url: &str,
     token: &str,
+    project_hint: Option<&str>,
 ) -> Result<AntigravityUsage, PollError> {
-    let project = fetch_antigravity_project(base_url, token)?;
+    let project = match project_hint {
+        Some(project) => Some(project.to_string()),
+        None => fetch_antigravity_project(base_url, token)?,
+    };
     if let Some(project) = project.as_deref() {
         match fetch_antigravity_quota_summary(base_url, token, project) {
             Ok(data) => return Ok(data),
@@ -1858,6 +1911,186 @@ fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
     }
 }
 
+/// Pick the access token for this poll: the stored one while it is valid, else
+/// a token refreshed in memory with the stored refresh token. Falls back to the
+/// stored token (and so to the existing sign-in prompt) when no refresh is
+/// possible.
+fn resolve_antigravity_access(creds: &AntigravityTokenData, now: SystemTime) -> AntigravityAccess {
+    let stored = || AntigravityAccess {
+        access_token: creds.access_token.clone(),
+        project: None,
+    };
+    let expiry = parse_iso8601(creds.expiry.as_deref());
+    if !antigravity_needs_refresh(expiry, now) {
+        return stored();
+    }
+    let Some(refresh_token) = creds.refresh_token.as_deref().filter(|t| !t.is_empty()) else {
+        return stored();
+    };
+    let refresh_fingerprint = token_fingerprint(refresh_token);
+    let client = load_antigravity_oauth_client(refresh_token);
+    let project = client.as_ref().and_then(|client| antigravity_project_hint(client, refresh_token));
+
+    if let Some(cached) = cached_antigravity_token(refresh_fingerprint, now) {
+        return AntigravityAccess {
+            access_token: cached,
+            project,
+        };
+    }
+    let Some(client) = client else {
+        diagnose::log("Antigravity token expired and no OAuth client file found; sign-in required");
+        return stored();
+    };
+    match refresh_antigravity_token(&client, refresh_token, now) {
+        Some((access_token, expires_at)) => {
+            if let Ok(mut cache) = ANTIGRAVITY_TOKEN_CACHE.lock() {
+                *cache = Some(CachedAccessToken {
+                    refresh_fingerprint,
+                    access_token: access_token.clone(),
+                    expires_at,
+                });
+            }
+            diagnose::log("Antigravity access token refreshed in memory");
+            AntigravityAccess {
+                access_token,
+                project,
+            }
+        }
+        None => stored(),
+    }
+}
+
+/// Refresh when the token is expired or within a minute of expiry. A token
+/// without a readable expiry is used as stored.
+fn antigravity_needs_refresh(expiry: Option<SystemTime>, now: SystemTime) -> bool {
+    match expiry {
+        Some(expiry) => now + ANTIGRAVITY_REFRESH_MARGIN >= expiry,
+        None => false,
+    }
+}
+
+fn cached_antigravity_token(refresh_fingerprint: u64, now: SystemTime) -> Option<String> {
+    let cache = ANTIGRAVITY_TOKEN_CACHE.lock().ok()?;
+    cache
+        .as_ref()
+        .filter(|cached| cached.refresh_fingerprint == refresh_fingerprint)
+        .filter(|cached| !antigravity_needs_refresh(Some(cached.expires_at), now))
+        .map(|cached| cached.access_token.clone())
+}
+
+/// The client file's project belongs to the account it was issued for; use it
+/// only when that is the same sign-in as `agy`'s.
+fn antigravity_project_hint(client: &AntigravityOAuthClient, refresh_token: &str) -> Option<String> {
+    (client.refresh_token.as_deref() == Some(refresh_token))
+        .then(|| client.project_id.clone())
+        .flatten()
+        .filter(|project| !project.is_empty())
+}
+
+fn refresh_antigravity_token(
+    client: &AntigravityOAuthClient,
+    refresh_token: &str,
+    now: SystemTime,
+) -> Option<(String, SystemTime)> {
+    let agent = build_agent().ok()?;
+    let token_uri = client
+        .token_uri
+        .as_deref()
+        .filter(|uri| uri.starts_with("https://"))
+        .unwrap_or(ANTIGRAVITY_DEFAULT_TOKEN_URI);
+    let response = agent.post(token_uri).send_form(&[
+        ("client_id", client.client_id.as_str()),
+        ("client_secret", client.client_secret.as_str()),
+        ("refresh_token", refresh_token),
+        ("grant_type", "refresh_token"),
+    ]);
+    let body = match response {
+        Ok(response) => response.into_string().ok()?,
+        Err(ureq::Error::Status(code, _)) => {
+            diagnose::log(format!("Antigravity token refresh returned status {code}"));
+            return None;
+        }
+        Err(error) => {
+            diagnose::log_error("Antigravity token refresh request failed", error);
+            return None;
+        }
+    };
+    let parsed = parse_google_token_response(&body, now);
+    if parsed.is_none() {
+        diagnose::log("unable to parse Antigravity token refresh response");
+    }
+    parsed
+}
+
+fn parse_google_token_response(body: &str, now: SystemTime) -> Option<(String, SystemTime)> {
+    let response: GoogleTokenResponse = serde_json::from_str(body).ok()?;
+    if response.access_token.is_empty() {
+        return None;
+    }
+    // Google access tokens last an hour; assume that if the field is missing.
+    let lifetime = Duration::from_secs(response.expires_in.unwrap_or(3600));
+    Some((response.access_token, now + lifetime))
+}
+
+/// Client file sources, in order: the env var, `antigravity_oauth_client_file`
+/// in settings.json, then T3 Code's per-account `acp_token.json` files.
+fn load_antigravity_oauth_client(refresh_token: &str) -> Option<AntigravityOAuthClient> {
+    let explicit = std::env::var_os(ANTIGRAVITY_CLIENT_FILE_ENV)
+        .map(PathBuf::from)
+        .or_else(antigravity_client_file_from_settings);
+    if let Some(path) = explicit {
+        return read_antigravity_oauth_client(&path);
+    }
+
+    let pattern_root = dirs::home_dir()?
+        .join(".t3")
+        .join("userdata")
+        .join("providers")
+        .join("antigravity");
+    let candidates = std::fs::read_dir(pattern_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path().join("antigravity-acp").join("acp_token.json");
+            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+            Some((modified, read_antigravity_oauth_client(&path)?))
+        })
+        .collect();
+    select_antigravity_oauth_client(candidates, refresh_token)
+}
+
+fn antigravity_client_file_from_settings() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("APPDATA")?)
+        .join("ClaudeCodeUsageMonitor")
+        .join("settings.json");
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    settings
+        .get("antigravity_oauth_client_file")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn read_antigravity_oauth_client(path: &PathBuf) -> Option<AntigravityOAuthClient> {
+    let client: AntigravityOAuthClient =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    (!client.client_id.is_empty() && !client.client_secret.is_empty()).then_some(client)
+}
+
+/// Prefer the file issued for the same sign-in as `agy`, else the newest one.
+fn select_antigravity_oauth_client(
+    mut candidates: Vec<(SystemTime, AntigravityOAuthClient)>,
+    refresh_token: &str,
+) -> Option<AntigravityOAuthClient> {
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    let matching = candidates
+        .iter()
+        .position(|(_, client)| client.refresh_token.as_deref() == Some(refresh_token));
+    let index = matching.unwrap_or(0);
+    (index < candidates.len()).then(|| candidates.swap_remove(index).1)
+}
+
 fn read_windows_generic_credential(target: &str) -> Option<String> {
     const CRED_TYPE_GENERIC: u32 = 1;
 
@@ -2255,6 +2488,102 @@ mod tests {
             refresh_fingerprint: Some(fingerprint),
             expires_at: Some(expires_at),
         }
+    }
+
+    fn antigravity_client(refresh: Option<&str>, project: Option<&str>) -> AntigravityOAuthClient {
+        AntigravityOAuthClient {
+            client_id: "fixture-client".into(),
+            client_secret: "fixture-secret".into(),
+            token_uri: None,
+            refresh_token: refresh.map(Into::into),
+            project_id: project.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn antigravity_refresh_decision_uses_sixty_second_margin() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert!(!antigravity_needs_refresh(Some(now + Duration::from_secs(61)), now));
+        assert!(antigravity_needs_refresh(Some(now + Duration::from_secs(60)), now));
+        assert!(antigravity_needs_refresh(Some(now - Duration::from_secs(1)), now));
+        assert!(!antigravity_needs_refresh(None, now));
+    }
+
+    #[test]
+    fn antigravity_agy_expiry_with_offset_and_long_fraction_parses() {
+        let expiry = parse_iso8601(Some("2026-11-22T00:39:44.9530961+05:45")).unwrap();
+        let utc = parse_iso8601(Some("2026-11-21T18:54:44Z")).unwrap();
+        assert_eq!(expiry, utc);
+    }
+
+    #[test]
+    fn antigravity_credential_fixture_keeps_refresh_fields() {
+        let auth: AntigravityAuthFile = serde_json::from_str(
+            r#"{"token":{"access_token":"a","token_type":"Bearer","refresh_token":"r","expiry":"2026-11-22T00:39:44.9530961+05:45","expires_in":3599},"auth_method":"oauth-personal","id_token_email":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(auth.token.refresh_token.as_deref(), Some("r"));
+        assert!(parse_iso8601(auth.token.expiry.as_deref()).is_some());
+    }
+
+    #[test]
+    fn google_token_response_parses_and_rejects_errors() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let (token, expires) =
+            parse_google_token_response(r#"{"access_token":"new","expires_in":3599,"token_type":"Bearer"}"#, now)
+                .unwrap();
+        assert_eq!(token, "new");
+        assert_eq!(expires, now + Duration::from_secs(3599));
+        assert!(parse_google_token_response(r#"{"error":"invalid_grant"}"#, now).is_none());
+        assert!(parse_google_token_response(r#"{"access_token":""}"#, now).is_none());
+    }
+
+    #[test]
+    fn antigravity_client_prefers_same_sign_in_then_newest() {
+        let t = |secs| UNIX_EPOCH + Duration::from_secs(secs);
+        let picked = select_antigravity_oauth_client(
+            vec![
+                (t(30), antigravity_client(Some("other"), Some("p-new"))),
+                (t(10), antigravity_client(Some("mine"), Some("p-mine"))),
+            ],
+            "mine",
+        )
+        .unwrap();
+        assert_eq!(picked.project_id.as_deref(), Some("p-mine"));
+
+        let newest = select_antigravity_oauth_client(
+            vec![
+                (t(10), antigravity_client(Some("a"), Some("p-old"))),
+                (t(30), antigravity_client(Some("b"), Some("p-new"))),
+            ],
+            "mine",
+        )
+        .unwrap();
+        assert_eq!(newest.project_id.as_deref(), Some("p-new"));
+        assert!(select_antigravity_oauth_client(Vec::new(), "mine").is_none());
+    }
+
+    #[test]
+    fn antigravity_project_hint_only_for_same_sign_in() {
+        assert_eq!(
+            antigravity_project_hint(&antigravity_client(Some("mine"), Some("p1")), "mine").as_deref(),
+            Some("p1")
+        );
+        assert!(antigravity_project_hint(&antigravity_client(Some("other"), Some("p1")), "mine").is_none());
+        assert!(antigravity_project_hint(&antigravity_client(Some("mine"), Some("")), "mine").is_none());
+    }
+
+    #[test]
+    fn antigravity_valid_token_is_used_without_refresh() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let creds = AntigravityTokenData {
+            access_token: "stored".into(),
+            refresh_token: Some("r".into()),
+            expiry: Some("2027-01-16T08:00:00Z".into()),
+        };
+        let access = resolve_antigravity_access(&creds, now);
+        assert_eq!(access.access_token, "stored");
+        assert!(access.project.is_none());
     }
 
     #[test]
