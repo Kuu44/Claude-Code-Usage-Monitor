@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,13 +13,17 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::{
     HCF_HIGHCONTRASTON, HIGHCONTRASTW, HWINEVENTHOOK, MSAAMENUINFO, MSAA_MENU_SIG,
 };
 use windows::Win32::UI::Controls::{
     CloseThemeData, GetThemeColor, OpenThemeData, DRAWITEMSTRUCT, MEASUREITEMSTRUCT,
     MENU_POPUPBACKGROUND, ODS_CHECKED, ODS_DISABLED, ODS_FOCUS, ODS_GRAYED, ODS_HOTLIGHT,
-    ODS_NOFOCUSRECT, ODS_SELECTED, ODT_MENU, TMT_FILLCOLOR,
+    ODS_NOFOCUSRECT, ODS_SELECTED, ODT_MENU, TMT_FILLCOLOR, NMHDR, NMTTDISPINFOW,
+    TOOLTIPS_CLASSW, TTDT_AUTOPOP, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_POP,
+    TTM_SETDELAYTIME, TTM_SETMAXTIPWIDTH, TTM_UPDATE, TTN_GETDISPINFOW, TTS_ALWAYSTIP,
+    TTS_NOPREFIX, TTTOOLINFOW,
 };
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -2551,6 +2555,182 @@ fn layout_for_state(state: &AppState) -> crate::widget_layout::Layout {
     }
 }
 
+static TOOLTIP_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Widget column under the cursor (provider index), or -1 for none.
+static HOVER_COLUMN: AtomicIsize = AtomicIsize::new(-1);
+
+thread_local! {
+    static TOOLTIP_TEXT: RefCell<Vec<u16>> = RefCell::new(vec![0]);
+}
+
+/// A tooltip covering the whole widget; its text comes from the provider
+/// column under the cursor (`hover_tooltip_text`).
+unsafe fn create_hover_tooltip(owner: HWND, hinstance: HINSTANCE) {
+    let tooltip = match CreateWindowExW(
+        WS_EX_TOPMOST,
+        TOOLTIPS_CLASSW,
+        PCWSTR::null(),
+        WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX),
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        owner,
+        HMENU::default(),
+        hinstance,
+        None,
+    ) {
+        Ok(tooltip) => tooltip,
+        Err(error) => {
+            diagnose::log_error("unable to create hover tooltip", error);
+            return;
+        }
+    };
+    let mut tool = TTTOOLINFOW {
+        cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+        uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+        hwnd: owner,
+        uId: owner.0 as usize,
+        // LPSTR_TEXTCALLBACKW: ask for the text with TTN_GETDISPINFOW.
+        lpszText: PWSTR(-1isize as *mut u16),
+        ..Default::default()
+    };
+    SendMessageW(
+        tooltip,
+        TTM_ADDTOOLW,
+        WPARAM(0),
+        LPARAM(&mut tool as *mut TTTOOLINFOW as isize),
+    );
+    SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, WPARAM(0), LPARAM(sc(460) as isize));
+    SendMessageW(
+        tooltip,
+        TTM_SETDELAYTIME,
+        WPARAM(TTDT_AUTOPOP as usize),
+        LPARAM(30_000),
+    );
+    TOOLTIP_HWND.store(tooltip.0 as isize, Ordering::Relaxed);
+}
+
+/// Provider column whose bar or value spans `client_x`. Mirrors `draw_row`.
+fn hover_column_at(
+    client_x: i32,
+    layout: &crate::widget_layout::Layout,
+    enabled: [bool; 7],
+) -> Option<usize> {
+    let mut column_x = sc(LEFT_DIVIDER_W)
+        + sc(DIVIDER_RIGHT_MARGIN)
+        + sc(layout.label_width)
+        + sc(LABEL_RIGHT_MARGIN);
+    if client_x < column_x {
+        return None;
+    }
+    for i in 0..7 {
+        if !enabled[i] {
+            continue;
+        }
+        let graphic = layout.graphics[i];
+        let visual_width = if graphic == crate::widget_layout::Graphic::None {
+            0
+        } else {
+            sc(graphic.width() + crate::widget_layout::GAP)
+        };
+        column_x += visual_width + sc(layout.text_widths[i] + crate::widget_layout::GROUP_GAP);
+        if client_x < column_x {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn update_hover_column(client_x: i32) {
+    let column = {
+        let state = lock_state();
+        state.as_ref().and_then(|s| {
+            if s.dragging || s.resizing {
+                return None;
+            }
+            let enabled = [
+                s.show_claude_code,
+                s.show_codex,
+                s.show_antigravity,
+                s.show_antigravity_claude,
+                s.show_antigravity_argon,
+                s.show_grok,
+                s.show_cursor,
+            ];
+            hover_column_at(client_x, &layout_for_state(s), enabled)
+        })
+    };
+    let column = column.map_or(-1, |c| c as isize);
+    if HOVER_COLUMN.swap(column, Ordering::Relaxed) == column {
+        return;
+    }
+    let tooltip = TOOLTIP_HWND.load(Ordering::Relaxed);
+    if tooltip == 0 {
+        return;
+    }
+    let tooltip = HWND(tooltip as *mut std::ffi::c_void);
+    unsafe {
+        // Hide the old provider's text; the next hover shows the new one.
+        SendMessageW(tooltip, TTM_POP, WPARAM(0), LPARAM(0));
+        if column >= 0 {
+            SendMessageW(tooltip, TTM_UPDATE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// Text for the hovered column, kept alive in a thread-local buffer that the
+/// tooltip reads after the notification returns.
+fn hover_tooltip_text() -> PWSTR {
+    let column = HOVER_COLUMN.load(Ordering::Relaxed);
+    let text = if column < 0 {
+        String::new()
+    } else {
+        let data = lock_state().as_ref().and_then(|s| s.data.clone());
+        crate::hover_details::provider_details(
+            column as usize,
+            data.as_ref(),
+            &crate::usage_stats::latest(),
+            SystemTime::now(),
+            &local_clock,
+        )
+    };
+    TOOLTIP_TEXT.with(|buffer| {
+        let mut buffer = buffer.borrow_mut();
+        *buffer = text.encode_utf16().chain(std::iter::once(0)).collect();
+        PWSTR(buffer.as_mut_ptr())
+    })
+}
+
+/// Weekday and local wall-clock time, e.g. "Sat 14:30".
+fn local_clock(time: SystemTime) -> String {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let Ok(since_epoch) = time.duration_since(UNIX_EPOCH) else {
+        return String::new();
+    };
+    // FILETIME counts 100 ns intervals since 1601-01-01.
+    let ticks = (since_epoch.as_secs() + 11_644_473_600) * 10_000_000;
+    let file_time = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME::default();
+    let mut local = SYSTEMTIME::default();
+    unsafe {
+        if FileTimeToSystemTime(&file_time, &mut utc).is_err()
+            || SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).is_err()
+        {
+            return String::new();
+        }
+    }
+    format!(
+        "{} {:02}:{:02}",
+        DAYS[local.wDayOfWeek as usize % 7],
+        local.wHour,
+        local.wMinute
+    )
+}
+
 fn total_widget_width_for_state(state: &AppState) -> i32 {
     sc(layout_for_state(state).width)
 }
@@ -2722,6 +2902,7 @@ pub fn run() {
         }
 
         diagnose::log(format!("main window created hwnd={:?}", hwnd));
+        create_hover_tooltip(hwnd, hinstance.into());
 
         let is_dark = theme::is_dark_mode();
         let mut embedded = false;
@@ -3399,6 +3580,7 @@ fn do_poll(send_hwnd: SendHwnd) {
         show_cursor,
     ) {
         Ok(data) => {
+            let stats_input = data.clone();
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
                 if let Some(claude_code) = data.claude_code.as_ref() {
@@ -3479,10 +3661,14 @@ fn do_poll(send_hwnd: SendHwnd) {
                 s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
                 s.auth_watch_snapshot.clear();
             }
+            drop(state);
 
             unsafe {
                 let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
             }
+            // After the UI update: the first scan of the transcript folders can
+            // take seconds; later scans only read what was appended.
+            crate::usage_stats::refresh(&stats_input);
         }
         Err(failure) => {
             let e = failure.error;
@@ -4151,6 +4337,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            update_hover_column((lparam.0 & 0xFFFF) as i16 as i32);
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let resize = {
@@ -4689,6 +4876,17 @@ unsafe extern "system" fn wnd_proc(
             tray_icon::remove_all(hwnd);
             PostQuitMessage(0);
             LRESULT(0)
+        }
+        WM_NOTIFY => {
+            let header = &*(lparam.0 as *const NMHDR);
+            if header.hwndFrom.0 as isize == TOOLTIP_HWND.load(Ordering::Relaxed)
+                && header.code == TTN_GETDISPINFOW
+            {
+                let info = &mut *(lparam.0 as *mut NMTTDISPINFOW);
+                info.lpszText = hover_tooltip_text();
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -6719,5 +6917,55 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         let _ = FillRgn(hdc, rgn, brush);
         let _ = DeleteObject(rgn);
         let _ = DeleteObject(brush);
+    }
+}
+
+#[cfg(test)]
+mod hover_tests {
+    use super::*;
+
+    #[test]
+    fn hover_column_follows_drawn_provider_columns() {
+        let enabled = [true, true, false, false, false, false, false];
+        let layout = crate::widget_layout::layout(None, enabled, [false; 7]);
+        let first = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN) + sc(layout.label_width)
+            + sc(LABEL_RIGHT_MARGIN);
+        let column_width = |layout: &crate::widget_layout::Layout, i: usize| {
+            sc(layout.graphics[i].width() + crate::widget_layout::GAP)
+                + sc(layout.text_widths[i] + crate::widget_layout::GROUP_GAP)
+        };
+        let second = first + column_width(&layout, 0);
+        let end = second + column_width(&layout, 1);
+
+        assert_eq!(hover_column_at(first - 1, &layout, enabled), None);
+        assert_eq!(hover_column_at(first, &layout, enabled), Some(0));
+        assert_eq!(hover_column_at(second - 1, &layout, enabled), Some(0));
+        assert_eq!(hover_column_at(second, &layout, enabled), Some(1));
+        assert_eq!(hover_column_at(end, &layout, enabled), None);
+
+        // A disabled provider takes no space: Grok comes right after Claude.
+        let enabled = [true, false, false, false, false, true, false];
+        let layout = crate::widget_layout::layout(None, enabled, [false; 7]);
+        let second = first + column_width(&layout, 0);
+        assert_eq!(hover_column_at(second, &layout, enabled), Some(5));
+    }
+
+    #[test]
+    #[ignore = "Reads live usage (no refresh) and local transcripts; prints the hover text"]
+    fn hover_live_text_dump() {
+        let data = crate::poller::read_only_live_usage();
+        crate::usage_stats::refresh(&data);
+        let stats = crate::usage_stats::latest();
+        for column in [0, 1] {
+            let text = crate::hover_details::provider_details(
+                column,
+                Some(&data),
+                &stats,
+                SystemTime::now(),
+                &local_clock,
+            );
+            println!("----- column {column} -----");
+            println!("{}", text.replace("\r\n", "\n"));
+        }
     }
 }

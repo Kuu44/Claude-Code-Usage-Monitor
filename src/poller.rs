@@ -2295,7 +2295,7 @@ fn is_token_expired(expires_at: Option<i64>) -> bool {
 }
 
 /// Parse an ISO 8601 timestamp string into a SystemTime.
-fn parse_iso8601(s: Option<&str>) -> Option<SystemTime> {
+pub(crate) fn parse_iso8601(s: Option<&str>) -> Option<SystemTime> {
     let s = s?;
     if s.len() < 10 || !s.is_char_boundary(10) {
         return None;
@@ -2475,6 +2475,20 @@ pub fn app_is_past_reset(data: &AppUsageData) -> bool {
         || data.antigravity_argon.as_ref().is_some_and(is_past_reset)
         || data.grok.as_ref().is_some_and(is_past_reset)
         || data.cursor.as_ref().is_some_and(is_past_reset)
+}
+
+/// Live usage for a read-only manual check: no token refresh, no CLI calls.
+/// A provider whose stored token is expired or rejected is left empty.
+#[cfg(test)]
+pub(crate) fn read_only_live_usage() -> AppUsageData {
+    let mut data = AppUsageData::default();
+    if let Some(creds) = read_first_credentials().filter(|c| !is_token_expired(c.expires_at)) {
+        data.claude_code = fetch_usage_with_fallback(&creds.access_token).ok();
+    }
+    if let Some(creds) = read_codex_credentials() {
+        data.codex = fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()).ok();
+    }
+    data
 }
 
 #[cfg(test)]

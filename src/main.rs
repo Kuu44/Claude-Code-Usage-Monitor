@@ -1,13 +1,16 @@
 #![windows_subsystem = "windows"]
 
 mod diagnose;
+mod hover_details;
 mod localization;
 mod models;
 mod native_interop;
 mod poller;
+mod pricing;
 mod theme;
 mod tray_icon;
 mod updater;
+mod usage_stats;
 mod widget_layout;
 mod window;
 
