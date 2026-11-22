@@ -43,6 +43,9 @@ const ANTIGRAVITY_CLIENT_FILE_ENV: &str = "CLAUDE_USAGE_MONITOR_ANTIGRAVITY_OAUT
 /// Codex sign-in fingerprint seen after an app-server read that failed; the
 /// app-server is not started again until the sign-in changes.
 static FAILED_CODEX_REFRESH: Mutex<Option<u64>> = Mutex::new(None);
+/// Grok sign-in fingerprint seen after a CLI refresh that did not help; the
+/// CLI is not started again until Grok's sign-in changes.
+static FAILED_GROK_REFRESH: Mutex<Option<u64>> = Mutex::new(None);
 static FAILED_CLAUDE_REFRESHES: Mutex<Vec<(String, ClaudeRefreshKey)>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -524,8 +527,73 @@ fn poll_antigravity() -> Result<AntigravityUsage, PollError> {
 }
 
 fn poll_grok() -> Result<UsageData, PollError> {
-    let credentials = read_grok_credentials().ok_or(PollError::NoCredentials)?;
+    let credentials = match read_grok_credentials() {
+        Some(credentials) => credentials,
+        None => refresh_grok_sign_in().ok_or(PollError::NoCredentials)?,
+    };
     fetch_grok_usage(&credentials)
+}
+
+/// Grok's stored token lasts a few hours and xAI rotates its refresh token, so
+/// the widget never refreshes it itself (that would sign the Grok CLI out).
+/// Any Grok CLI start renews the sign-in and saves it to `auth.json`; `grok
+/// models` does that and only lists models: no model turn, no session.
+fn refresh_grok_sign_in() -> Option<GrokCredentials> {
+    let content = std::fs::read_to_string(grok_auth_path()?).ok()?;
+    let entries: BTreeMap<String, GrokAuthEntry> = serde_json::from_str(&content).ok()?;
+    let sign_in = grok_expired_sign_in_fingerprint(&entries)?;
+    let last_failed = FAILED_GROK_REFRESH.lock().ok().and_then(|failed| *failed);
+    if last_failed == Some(sign_in) {
+        return None;
+    }
+
+    let grok = dirs::home_dir()
+        .map(|home| home.join(".grok").join("bin").join("grok.exe"))
+        .filter(|path| path.is_file())
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|| "grok".into());
+    diagnose::log("Grok sign-in expired; renewing it with `grok models`");
+    let mut cmd = Command::new(grok);
+    cmd.arg("models")
+        .current_dir(claude_refresh_working_dir())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _ = run_with_timeout(&mut cmd, Duration::from_secs(30));
+
+    let refreshed = read_grok_credentials();
+    if refreshed.is_none() {
+        diagnose::log("Grok sign-in still expired after `grok models`");
+        let after = grok_auth_path()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|content| serde_json::from_str(&content).ok())
+            .and_then(|entries| grok_expired_sign_in_fingerprint(&entries))
+            .unwrap_or(sign_in);
+        if let Ok(mut failed) = FAILED_GROK_REFRESH.lock() {
+            *failed = Some(after);
+        }
+    }
+    refreshed
+}
+
+/// Fingerprint of the first-party Grok sign-ins that only lack a current
+/// token (refresh token present, expiry passed). None if there is no such
+/// sign-in, i.e. nothing the Grok CLI could renew. Never logged.
+fn grok_expired_sign_in_fingerprint(entries: &BTreeMap<String, GrokAuthEntry>) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    let mut found = false;
+    for entry in entries.values() {
+        let renewable = matches!(entry.auth_mode, GrokAuthMode::Oidc | GrokAuthMode::External)
+            && entry.refresh_token.as_deref().is_some_and(|value| !value.trim().is_empty())
+            && entry.oidc_issuer.as_deref().is_some_and(is_xai_grok_issuer);
+        if renewable {
+            found = true;
+            entry.refresh_token.hash(&mut hasher);
+            entry.expires_at.hash(&mut hasher);
+        }
+    }
+    found.then(|| hasher.finish())
 }
 
 fn poll_cursor() -> Result<UsageData, PollError> {
@@ -2618,6 +2686,19 @@ mod tests {
         let access = resolve_antigravity_access(&creds, now);
         assert_eq!(access.access_token, "stored");
         assert!(access.project.is_none());
+    }
+
+    #[test]
+    fn grok_expired_sign_in_is_renewable_and_fingerprint_tracks_it() {
+        let parse = |json: &str| serde_json::from_str::<BTreeMap<String, GrokAuthEntry>>(json).unwrap();
+        let expired = parse(r#"{"https://auth.x.ai::u":{"key":"k","auth_mode":"oidc","user_id":"u","refresh_token":"rt-1","oidc_issuer":"https://auth.x.ai","expires_at":"2020-01-01T00:00:00Z"}}"#);
+        let rotated = parse(r#"{"https://auth.x.ai::u":{"key":"k","auth_mode":"oidc","user_id":"u","refresh_token":"rt-2","oidc_issuer":"https://auth.x.ai","expires_at":"2020-01-01T00:00:00Z"}}"#);
+        let api_key = parse(r#"{"x":{"key":"k","auth_mode":"api_key","user_id":"u"}}"#);
+        let a = grok_expired_sign_in_fingerprint(&expired).unwrap();
+        assert_eq!(Some(a), grok_expired_sign_in_fingerprint(&expired));
+        assert_ne!(Some(a), grok_expired_sign_in_fingerprint(&rotated));
+        assert_eq!(grok_expired_sign_in_fingerprint(&api_key), None);
+        assert!(select_grok_credentials(expired).is_none());
     }
 
     #[test]
