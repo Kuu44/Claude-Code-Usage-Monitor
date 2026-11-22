@@ -5,6 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -15,7 +16,7 @@ use crate::localization::Strings;
 use crate::models::{AntigravityUsage, AppUsageData, UsageData, UsageSection};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+const CLAUDE_USAGE_USER_AGENT: &str = "claude-code/2.1.327";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const CURSOR_USAGE_URL: &str =
@@ -30,8 +31,23 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const PROVIDER_CLIENT_VERSION: &str =
     concat!("claude-code-usage-monitor/", env!("CARGO_PKG_VERSION"));
 
-const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-3-haiku-20240307", "claude-haiku-4-5-20251001"];
 static CURSOR_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Credential state seen right after a CLI refresh that left the token expired,
+/// per credential source. While the stored refresh token and expiry stay the
+/// same, the CLI is not called again (see `claude_refresh_decision`).
+/// Antigravity access token refreshed in this process. Kept in memory only:
+/// `agy` owns the Credential Manager entry and nothing is written back.
+static ANTIGRAVITY_TOKEN_CACHE: Mutex<Option<CachedAccessToken>> = Mutex::new(None);
+const ANTIGRAVITY_REFRESH_MARGIN: Duration = Duration::from_secs(60);
+const ANTIGRAVITY_DEFAULT_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
+const ANTIGRAVITY_CLIENT_FILE_ENV: &str = "CLAUDE_USAGE_MONITOR_ANTIGRAVITY_OAUTH_CLIENT_FILE";
+/// Codex sign-in fingerprint seen after an app-server read that failed; the
+/// app-server is not started again until the sign-in changes.
+static FAILED_CODEX_REFRESH: Mutex<Option<u64>> = Mutex::new(None);
+/// Grok sign-in fingerprint seen after a CLI refresh that did not help; the
+/// CLI is not started again until Grok's sign-in changes.
+static FAILED_GROK_REFRESH: Mutex<Option<u64>> = Mutex::new(None);
+static FAILED_CLAUDE_REFRESHES: Mutex<Vec<(String, ClaudeRefreshKey)>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PollError {
@@ -89,6 +105,41 @@ struct CodexAuthFile {
 struct CodexTokenData {
     access_token: String,
     account_id: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+impl CodexTokenData {
+    /// Changes whenever Codex refreshes or replaces its sign-in. Never logged.
+    fn sign_in_fingerprint(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.access_token.hash(&mut hasher);
+        self.refresh_token.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+/// `account/rateLimits/read` result from `codex app-server`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerRateLimits {
+    rate_limits: Option<CodexAppServerSnapshot>,
+    rate_limits_by_limit_id: Option<BTreeMap<String, CodexAppServerSnapshot>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerSnapshot {
+    primary: Option<CodexAppServerWindow>,
+    secondary: Option<CodexAppServerWindow>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppServerWindow {
+    used_percent: f64,
+    window_duration_mins: Option<i64>,
+    resets_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +169,45 @@ struct AntigravityAuthFile {
 #[derive(Deserialize)]
 struct AntigravityTokenData {
     access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expiry: Option<String>,
+}
+
+/// OAuth installed-app client used to refresh the `agy` sign-in, read from a
+/// local file (never stored in this repository). T3 Code's
+/// `antigravity-acp/acp_token.json` has this shape.
+#[derive(Clone, Deserialize)]
+struct AntigravityOAuthClient {
+    client_id: String,
+    client_secret: String,
+    #[serde(default)]
+    token_uri: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GoogleTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+#[derive(Clone)]
+struct CachedAccessToken {
+    refresh_fingerprint: u64,
+    access_token: String,
+    expires_at: SystemTime,
+}
+
+/// Token and optional project to use for one Antigravity poll.
+struct AntigravityAccess {
+    access_token: String,
+    project: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -384,14 +474,37 @@ fn poll_codex() -> Result<UsageData, PollError> {
     };
 
     match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
-        Ok(data) => Ok(data),
         Err(PollError::AuthRequired) => {
-            cli_refresh_codex_token();
-            let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
-            fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())
+            let sign_in = creds.sign_in_fingerprint();
+            let last_failed = FAILED_CODEX_REFRESH.lock().ok().and_then(|failed| *failed);
+            if !codex_refresh_allowed(last_failed, sign_in) {
+                diagnose::log(
+                    "skipping Codex app-server read: last attempt failed and the sign-in has not changed",
+                );
+                return Err(PollError::TokenExpired);
+            }
+            // The Codex binary refreshes its own sign-in when it needs to, and
+            // reading rate limits runs no model turn and saves no session.
+            match codex_app_server_rate_limits() {
+                Some(data) => Ok(data),
+                None => {
+                    let after = read_codex_credentials()
+                        .map(|creds| creds.sign_in_fingerprint())
+                        .unwrap_or(sign_in);
+                    if let Ok(mut failed) = FAILED_CODEX_REFRESH.lock() {
+                        *failed = Some(after);
+                    }
+                    Err(PollError::TokenExpired)
+                }
+            }
         }
-        Err(error) => Err(error),
+        result => result,
     }
+}
+
+/// After a failed app-server read, wait for Codex's sign-in to change.
+fn codex_refresh_allowed(last_failed: Option<u64>, current: u64) -> bool {
+    last_failed != Some(current)
 }
 
 fn poll_antigravity() -> Result<AntigravityUsage, PollError> {
@@ -403,7 +516,8 @@ fn poll_antigravity() -> Result<AntigravityUsage, PollError> {
         }
     };
 
-    let data = fetch_antigravity_usage(&creds.access_token)?;
+    let access = resolve_antigravity_access(&creds, SystemTime::now());
+    let data = fetch_antigravity_usage(&access.access_token, access.project.as_deref())?;
     diagnose::log(format!(
         "Antigravity quota pools: Gemini={}, Claude/GPT={}, Argon={}",
         data.gemini.is_some(),
@@ -414,8 +528,73 @@ fn poll_antigravity() -> Result<AntigravityUsage, PollError> {
 }
 
 fn poll_grok() -> Result<UsageData, PollError> {
-    let credentials = read_grok_credentials().ok_or(PollError::NoCredentials)?;
+    let credentials = match read_grok_credentials() {
+        Some(credentials) => credentials,
+        None => refresh_grok_sign_in().ok_or(PollError::NoCredentials)?,
+    };
     fetch_grok_usage(&credentials)
+}
+
+/// Grok's stored token lasts a few hours and xAI rotates its refresh token, so
+/// the widget never refreshes it itself (that would sign the Grok CLI out).
+/// Any Grok CLI start renews the sign-in and saves it to `auth.json`; `grok
+/// models` does that and only lists models: no model turn, no session.
+fn refresh_grok_sign_in() -> Option<GrokCredentials> {
+    let content = std::fs::read_to_string(grok_auth_path()?).ok()?;
+    let entries: BTreeMap<String, GrokAuthEntry> = serde_json::from_str(&content).ok()?;
+    let sign_in = grok_expired_sign_in_fingerprint(&entries)?;
+    let last_failed = FAILED_GROK_REFRESH.lock().ok().and_then(|failed| *failed);
+    if last_failed == Some(sign_in) {
+        return None;
+    }
+
+    let grok = dirs::home_dir()
+        .map(|home| home.join(".grok").join("bin").join("grok.exe"))
+        .filter(|path| path.is_file())
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|| "grok".into());
+    diagnose::log("Grok sign-in expired; renewing it with `grok models`");
+    let mut cmd = Command::new(grok);
+    cmd.arg("models")
+        .current_dir(claude_refresh_working_dir())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _ = run_with_timeout(&mut cmd, Duration::from_secs(30));
+
+    let refreshed = read_grok_credentials();
+    if refreshed.is_none() {
+        diagnose::log("Grok sign-in still expired after `grok models`");
+        let after = grok_auth_path()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|content| serde_json::from_str(&content).ok())
+            .and_then(|entries| grok_expired_sign_in_fingerprint(&entries))
+            .unwrap_or(sign_in);
+        if let Ok(mut failed) = FAILED_GROK_REFRESH.lock() {
+            *failed = Some(after);
+        }
+    }
+    refreshed
+}
+
+/// Fingerprint of the first-party Grok sign-ins that only lack a current
+/// token (refresh token present, expiry passed). None if there is no such
+/// sign-in, i.e. nothing the Grok CLI could renew. Never logged.
+fn grok_expired_sign_in_fingerprint(entries: &BTreeMap<String, GrokAuthEntry>) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    let mut found = false;
+    for entry in entries.values() {
+        let renewable = matches!(entry.auth_mode, GrokAuthMode::Oidc | GrokAuthMode::External)
+            && entry.refresh_token.as_deref().is_some_and(|value| !value.trim().is_empty())
+            && entry.oidc_issuer.as_deref().is_some_and(is_xai_grok_issuer);
+        if renewable {
+            found = true;
+            entry.refresh_token.hash(&mut hasher);
+            entry.expires_at.hash(&mut hasher);
+        }
+    }
+    found.then(|| hasher.finish())
 }
 
 fn poll_cursor() -> Result<UsageData, PollError> {
@@ -430,15 +609,35 @@ fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError>
         }
 
         let source = creds.source.clone();
-        cli_refresh_token(&source);
+        let source_key = format!("{source:?}");
+        let decision = claude_refresh_decision(
+            failed_claude_refresh(&source_key),
+            creds.refresh_key(),
+            creds.refresh_expires_at,
+            unix_now_millis(),
+        );
 
-        match read_credentials_from_source(&source) {
-            Some(refreshed) if !is_token_expired(refreshed.expires_at) => return Ok(refreshed),
-            Some(_) => diagnose::log(format!(
-                "credentials from {source:?} still expired after refresh attempt"
+        match decision {
+            ClaudeRefreshDecision::Attempt => match refresh_claude_source(&source) {
+                Ok(refreshed) => {
+                    clear_failed_claude_refresh(&source_key);
+                    return Ok(refreshed);
+                }
+                Err(after) => {
+                    // Remember the credentials as they were after the failed
+                    // attempt; only a new sign-in (new refresh token or expiry)
+                    // re-arms the CLI refresh for this source.
+                    record_failed_claude_refresh(
+                        &source_key,
+                        after.unwrap_or_else(|| creds.refresh_key()),
+                    );
+                }
+            },
+            ClaudeRefreshDecision::SkipRefreshTokenExpired => diagnose::log(format!(
+                "skipping Claude CLI refresh for {source:?}: refresh token expired, sign-in required"
             )),
-            None => diagnose::log(format!(
-                "credentials from {source:?} unavailable after refresh attempt"
+            ClaudeRefreshDecision::SkipAfterFailedAttempt => diagnose::log(format!(
+                "skipping Claude CLI refresh for {source:?}: last attempt failed and the sign-in has not changed"
             )),
         }
 
@@ -449,23 +648,144 @@ fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError>
     }
 }
 
-/// Invoke the Claude CLI with a minimal prompt to force its internal
-/// OAuth token refresh.
-fn cli_refresh_token(source: &CredentialSource) {
-    match source {
-        CredentialSource::Windows(_) => cli_refresh_windows_token(),
-        CredentialSource::Wsl { distro } => cli_refresh_wsl_token(distro),
+/// Identity of the stored Claude sign-in, used by the refresh circuit breaker.
+/// Holds a hash of the refresh token, never the token itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClaudeRefreshKey {
+    refresh_fingerprint: Option<u64>,
+    expires_at: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaudeRefreshDecision {
+    Attempt,
+    SkipRefreshTokenExpired,
+    SkipAfterFailedAttempt,
+}
+
+/// Decide whether an expired Claude token may be refreshed through the CLI.
+///
+/// After one attempt leaves the token expired, the CLI is not called again until
+/// the refresh token or `expiresAt` changes. File size and mtime are not enough:
+/// a failed refresh, and MCP sign-ins stored in the same file, rewrite it too.
+fn claude_refresh_decision(
+    last_failed: Option<ClaudeRefreshKey>,
+    current: ClaudeRefreshKey,
+    refresh_expires_at: Option<i64>,
+    now_millis: i64,
+) -> ClaudeRefreshDecision {
+    if refresh_expires_at.is_some_and(|expires| now_millis >= expires) {
+        return ClaudeRefreshDecision::SkipRefreshTokenExpired;
+    }
+    if last_failed == Some(current) {
+        return ClaudeRefreshDecision::SkipAfterFailedAttempt;
+    }
+    ClaudeRefreshDecision::Attempt
+}
+
+fn failed_claude_refresh(source_key: &str) -> Option<ClaudeRefreshKey> {
+    let failures = FAILED_CLAUDE_REFRESHES.lock().ok()?;
+    failures
+        .iter()
+        .find(|(key, _)| key == source_key)
+        .map(|(_, refresh_key)| *refresh_key)
+}
+
+fn record_failed_claude_refresh(source_key: &str, refresh_key: ClaudeRefreshKey) {
+    if let Ok(mut failures) = FAILED_CLAUDE_REFRESHES.lock() {
+        failures.retain(|(key, _)| key != source_key);
+        failures.push((source_key.to_string(), refresh_key));
     }
 }
 
-fn cli_refresh_windows_token() {
+fn clear_failed_claude_refresh(source_key: &str) {
+    if let Ok(mut failures) = FAILED_CLAUDE_REFRESHES.lock() {
+        failures.retain(|(key, _)| key != source_key);
+    }
+}
+
+fn unix_now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+/// Refresh an expired Claude token through the CLI. Returns the refreshed
+/// credentials, or the refresh key read after the failed attempt (if readable).
+///
+/// `claude auth status` refreshes an expired OAuth token without a model call
+/// and without saving a session. Nothing here ever sends a model request: if
+/// that does not refresh the token, the widget asks for a new sign-in.
+fn refresh_claude_source(
+    source: &CredentialSource,
+) -> Result<Credentials, Option<ClaudeRefreshKey>> {
+    let mode = ClaudeRefreshMode::AuthStatus;
+    cli_refresh_token(source, mode);
+    match read_credentials_from_source(source) {
+        Some(refreshed) if !is_token_expired(refreshed.expires_at) => Ok(refreshed),
+        Some(refreshed) => {
+            diagnose::log(format!(
+                "credentials from {source:?} still expired after {mode:?} refresh"
+            ));
+            Err(Some(refreshed.refresh_key()))
+        }
+        None => {
+            diagnose::log(format!(
+                "credentials from {source:?} unavailable after {mode:?} refresh"
+            ));
+            Err(None)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaudeRefreshMode {
+    AuthStatus,
+}
+
+impl ClaudeRefreshMode {
+    fn cli_args(self) -> &'static [&'static str] {
+        match self {
+            Self::AuthStatus => &["auth", "status", "--json"],
+        }
+    }
+
+    fn shell_args(self) -> &'static str {
+        match self {
+            Self::AuthStatus => "auth status --json",
+        }
+    }
+}
+
+fn cli_refresh_token(source: &CredentialSource, mode: ClaudeRefreshMode) {
+    match source {
+        CredentialSource::Windows(_) => cli_refresh_windows_token(mode),
+        CredentialSource::Wsl { distro } => cli_refresh_wsl_token(distro, mode),
+    }
+}
+
+/// Working directory for CLI refresh children. A Run-key launch inherits
+/// `C:\WINDOWS\system32`; without this, any session the CLI saves lands there.
+fn claude_refresh_working_dir() -> PathBuf {
+    if let Some(dir) =
+        dirs::data_local_dir().map(|dir| dir.join("ClaudeCodeUsageMonitor").join("refresh"))
+    {
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return dir;
+        }
+    }
+    std::env::temp_dir()
+}
+
+fn cli_refresh_windows_token(mode: ClaudeRefreshMode) {
     let claude_path = resolve_windows_claude_path();
     let is_cmd = claude_path.to_lowercase().ends_with(".cmd");
     diagnose::log(format!(
-        "attempting Windows Claude token refresh via {claude_path}"
+        "attempting Windows Claude token refresh ({mode:?}) via {claude_path}"
     ));
 
-    let args: &[&str] = &["-p", "."];
+    let args = mode.cli_args();
 
     let mut cmd = if is_cmd {
         let mut c = Command::new("cmd.exe");
@@ -476,7 +796,8 @@ fn cli_refresh_windows_token() {
         c.args(args);
         c
     };
-    cmd.env_remove("CLAUDECODE")
+    cmd.current_dir(claude_refresh_working_dir())
+        .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
@@ -491,34 +812,31 @@ fn cli_refresh_windows_token() {
         }
     };
 
-    // Wait up to 30 seconds — don't block the poll thread forever
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() > Duration::from_secs(30) {
-                    let _ = child.kill();
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(_) => break,
-        }
-    }
+    wait_for_refresh(&mut child);
 }
 
-fn cli_refresh_wsl_token(distro: &str) {
+fn wsl_refresh_script(mode: ClaudeRefreshMode) -> String {
+    format!(
+        "d=\"$HOME/.cache/claude-code-usage-monitor/refresh\"; mkdir -p \"$d\" && cd \"$d\" || exit 1; \
+         if command -v claude >/dev/null 2>&1; then c=claude; \
+         elif [ -x \"$HOME/.local/bin/claude\" ]; then c=\"$HOME/.local/bin/claude\"; \
+         else exit 127; fi; \"$c\" {}",
+        mode.shell_args()
+    )
+}
+
+fn cli_refresh_wsl_token(distro: &str, mode: ClaudeRefreshMode) {
     diagnose::log(format!(
-        "attempting WSL Claude token refresh in distro {distro}"
+        "attempting WSL Claude token refresh ({mode:?}) in distro {distro}"
     ));
     let mut cmd = Command::new("wsl.exe");
-    cmd.arg("-d")
+    cmd.current_dir(claude_refresh_working_dir())
+        .arg("-d")
         .arg(distro)
         .arg("--")
         .arg("bash")
-        .arg("-lic")
-        .arg("if command -v claude >/dev/null 2>&1; then claude -p .; elif [ -x \"$HOME/.local/bin/claude\" ]; then \"$HOME/.local/bin/claude\" -p .; else exit 127; fi")
+        .arg("-lc")
+        .arg(wsl_refresh_script(mode))
         .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .creation_flags(CREATE_NO_WINDOW)
@@ -537,48 +855,129 @@ fn cli_refresh_wsl_token(distro: &str) {
     wait_for_refresh(&mut child);
 }
 
-fn cli_refresh_codex_token() {
+/// Read Codex rate limits from a short-lived `codex app-server` (JSON-RPC over
+/// stdio), the way T3 Code does. Returns None if Codex cannot answer.
+fn codex_app_server_rate_limits() -> Option<UsageData> {
+    use std::io::{BufRead, BufReader, Write};
+
     let codex_path = resolve_windows_codex_path();
-    let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
-    let is_ps1 = codex_path.to_lowercase().ends_with(".ps1");
-    diagnose::log(format!(
-        "attempting Windows Codex token refresh via {codex_path}"
-    ));
-
-    let args: &[&str] = &["exec", "."];
-
-    let mut cmd = if is_cmd {
+    let lower = codex_path.to_lowercase();
+    diagnose::log(format!("reading Codex rate limits via {codex_path} app-server"));
+    let mut cmd = if lower.ends_with(".cmd") {
         let mut c = Command::new("cmd.exe");
-        c.arg("/c").arg(&codex_path).args(args);
+        c.arg("/c").arg(&codex_path).arg("app-server");
         c
-    } else if is_ps1 {
+    } else if lower.ends_with(".ps1") {
         let mut c = Command::new("powershell.exe");
-        c.arg("-NoProfile")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-File")
+        c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(&codex_path)
-            .args(args);
+            .arg("app-server");
         c
     } else {
         let mut c = Command::new(&codex_path);
-        c.args(args);
+        c.arg("app-server");
         c
     };
-    cmd.creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+    cmd.current_dir(claude_refresh_working_dir())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
 
     let mut child = match cmd.spawn() {
-        Ok(c) => c,
+        Ok(child) => child,
         Err(error) => {
-            diagnose::log_error("unable to spawn Windows Codex token refresh", error);
-            return;
+            diagnose::log_error("unable to start codex app-server", error);
+            return None;
         }
     };
+    let mut stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"claude-code-usage-monitor","version":"1"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"initialized"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"account/rateLimits/read"}"#,
+        "\n"
+    );
+    let written = stdin
+        .write_all(requests.as_bytes())
+        .and_then(|_| stdin.flush());
 
-    wait_for_refresh(&mut child);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(answer) = codex_usage_from_app_server_line(&line) {
+                let _ = sender.send(answer);
+                return;
+            }
+        }
+    });
+    let answer = if written.is_ok() {
+        receiver.recv_timeout(Duration::from_secs(20)).ok().flatten()
+    } else {
+        None
+    };
+
+    // Closing stdin ends the app-server; kill the process tree if it lingers.
+    drop(stdin);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if matches!(child.try_wait(), Ok(None)) {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+
+    if answer.is_none() {
+        diagnose::log("codex app-server did not return rate limits");
+    }
+    answer
+}
+
+/// The answer to request 2, if `line` is it: Some(Some(data)) on success,
+/// Some(None) on an error reply, None for any other line.
+fn codex_usage_from_app_server_line(line: &str) -> Option<Option<UsageData>> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("id").and_then(serde_json::Value::as_i64) != Some(2) {
+        return None;
+    }
+    let Some(result) = value.get("result") else {
+        return Some(None);
+    };
+    let limits: CodexAppServerRateLimits = match serde_json::from_value(result.clone()) {
+        Ok(limits) => limits,
+        Err(_) => return Some(None),
+    };
+    let snapshot = limits
+        .rate_limits_by_limit_id
+        .and_then(|mut by_id| by_id.remove("codex"))
+        .or(limits.rate_limits);
+    let Some(snapshot) = snapshot else {
+        return Some(None);
+    };
+    let window = |w: CodexAppServerWindow| {
+        Some(Box::new(CodexRateLimitWindow {
+            used_percent: w.used_percent,
+            reset_at: w.resets_at.unwrap_or(0),
+            limit_window_seconds: None,
+            window_minutes: w.window_duration_mins,
+        }))
+    };
+    Some(codex_usage_from_response(CodexUsageResponse {
+        rate_limit: Some(Some(Box::new(CodexRateLimitDetails {
+            primary_window: Some(snapshot.primary.and_then(window)),
+            secondary_window: Some(snapshot.secondary.and_then(window)),
+        }))),
+    }))
 }
 
 /// Spawn a command and wait up to `timeout` for it to finish.
@@ -763,6 +1162,14 @@ fn credential_watch_signature(source: &CredentialSource) -> Option<String> {
 
 fn windows_credential_watch_signature(path: &PathBuf) -> String {
     let key = format!("win:{}", path.display());
+    // Watch the Claude sign-in itself. MCP server sign-ins share this file and
+    // rewrite it often, which would wake an auth-paused poll for nothing.
+    if let Some(creds) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| parse_credentials(&content, CredentialSource::Windows(path.clone())))
+    {
+        return claude_sign_in_signature(&key, creds.refresh_key());
+    }
     match std::fs::metadata(path) {
         Ok(metadata) => {
             let modified = metadata
@@ -775,6 +1182,14 @@ fn windows_credential_watch_signature(path: &PathBuf) -> String {
         }
         Err(_) => format!("{key}|missing"),
     }
+}
+
+fn claude_sign_in_signature(key: &str, refresh_key: ClaudeRefreshKey) -> String {
+    format!(
+        "{key}|oauth|{:x}|{}",
+        refresh_key.refresh_fingerprint.unwrap_or(0),
+        refresh_key.expires_at.unwrap_or(0)
+    )
 }
 
 fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
@@ -806,33 +1221,15 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
 }
 
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
-    // Try the dedicated usage endpoint first
+    // Only the usage endpoint: the old Messages API fallback sent a real
+    // model request just to read rate-limit headers, which spends usage.
     match try_usage_endpoint(token)? {
-        Some(data) => {
-            // If reset timers are missing, fill them in from the Messages API
-            if data.session.resets_at.is_none() || data.weekly.resets_at.is_none() {
-                if let Ok(fallback) = fetch_usage_via_messages(token) {
-                    let mut merged = data;
-                    if merged.session.resets_at.is_none() {
-                        merged.session.resets_at = fallback.session.resets_at;
-                    }
-                    if merged.weekly.resets_at.is_none() {
-                        merged.weekly.resets_at = fallback.weekly.resets_at;
-                    }
-                    return Ok(merged);
-                }
-            }
-            return Ok(data);
+        Some(data) => Ok(data),
+        None => {
+            diagnose::log("usage endpoint returned no usage data");
+            Err(PollError::RequestFailed)
         }
-        None => {}
     }
-
-    // Fall back to Messages API with rate limit headers
-    let result = fetch_usage_via_messages(token);
-    if result.is_err() {
-        diagnose::log("usage endpoint and Messages API fallback both failed");
-    }
-    result
 }
 
 fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
@@ -842,6 +1239,8 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         .get(USAGE_URL)
         .set("Authorization", &format!("Bearer {token}"))
         .set("anthropic-beta", "oauth-2025-04-20")
+        // Without a Claude Code user agent this endpoint answers 429.
+        .set("User-Agent", CLAUDE_USAGE_USER_AGENT)
         .call()
     {
         Ok(resp) => resp,
@@ -851,7 +1250,14 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
             ));
             return Err(PollError::AuthRequired);
         }
-        Err(_) => return Ok(None),
+        Err(ureq::Error::Status(code, _)) => {
+            diagnose::log(format!("usage endpoint returned status {code}"));
+            return Ok(None);
+        }
+        Err(error) => {
+            diagnose::log_error("usage endpoint request failed", error);
+            return Ok(None);
+        }
     };
 
     let response: UsageResponse = match resp.into_json() {
@@ -871,84 +1277,6 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
     }
 
     Ok(Some(data))
-}
-
-fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
-    let agent = build_agent()?;
-
-    for model in MODEL_FALLBACK_CHAIN {
-        let body = serde_json::json!({
-            "model": model,
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "."}]
-        });
-
-        let response = match agent
-            .post(MESSAGES_URL)
-            .set("Authorization", &format!("Bearer {token}"))
-            .set("anthropic-version", "2023-06-01")
-            .set("anthropic-beta", "oauth-2025-04-20")
-            .send_json(&body)
-        {
-            Ok(resp) => resp,
-            Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-                diagnose::log(format!(
-                    "messages endpoint returned auth error status {code}; re-login required"
-                ));
-                return Err(PollError::AuthRequired);
-            }
-            Err(ureq::Error::Status(_code, resp)) => resp,
-            Err(_) => continue,
-        };
-
-        let h5 = response.header("anthropic-ratelimit-unified-5h-utilization");
-        let h7 = response.header("anthropic-ratelimit-unified-7d-utilization");
-        let hs = response.header("anthropic-ratelimit-unified-status");
-
-        if h5.is_some() || h7.is_some() || hs.is_some() {
-            return Ok(parse_rate_limit_headers(&response));
-        }
-    }
-
-    Err(PollError::RequestFailed)
-}
-
-fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
-    let mut data = UsageData::default();
-
-    data.session.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization") * 100.0;
-    data.session.resets_at = unix_to_system_time(get_header_i64(
-        response,
-        "anthropic-ratelimit-unified-5h-reset",
-    ));
-
-    data.weekly.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization") * 100.0;
-    data.weekly.resets_at = unix_to_system_time(get_header_i64(
-        response,
-        "anthropic-ratelimit-unified-7d-reset",
-    ));
-
-    let overall_reset = get_header_i64(response, "anthropic-ratelimit-unified-reset");
-
-    if data.session.percentage == 0.0 && data.weekly.percentage == 0.0 {
-        let status = response.header("anthropic-ratelimit-unified-status");
-        if status == Some("rejected") {
-            let claim = response.header("anthropic-ratelimit-unified-representative-claim");
-            match claim {
-                Some("five_hour") => data.session.percentage = 100.0,
-                Some("seven_day") => data.weekly.percentage = 100.0,
-                _ => {}
-            }
-        }
-
-        if data.session.resets_at.is_none() && overall_reset.is_some() {
-            data.session.resets_at = unix_to_system_time(overall_reset);
-        }
-    }
-
-    data
 }
 
 fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData, PollError> {
@@ -1253,12 +1581,15 @@ fn antigravity_user_agent() -> &'static str {
     "antigravity/hub/2.24.0 (aidev_client; os_type=windows; arch=amd64; cl=963137146)"
 }
 
-fn fetch_antigravity_usage(token: &str) -> Result<AntigravityUsage, PollError> {
+fn fetch_antigravity_usage(
+    token: &str,
+    project_hint: Option<&str>,
+) -> Result<AntigravityUsage, PollError> {
     let mut auth_error = false;
     let mut last_error = PollError::RequestFailed;
 
     for base_url in ANTIGRAVITY_ENDPOINTS {
-        match fetch_antigravity_usage_from_endpoint(base_url, token) {
+        match fetch_antigravity_usage_from_endpoint(base_url, token, project_hint) {
             Ok(data) => return Ok(data),
             Err(PollError::AuthRequired) => auth_error = true,
             Err(error) => last_error = error,
@@ -1275,8 +1606,12 @@ fn fetch_antigravity_usage(token: &str) -> Result<AntigravityUsage, PollError> {
 fn fetch_antigravity_usage_from_endpoint(
     base_url: &str,
     token: &str,
+    project_hint: Option<&str>,
 ) -> Result<AntigravityUsage, PollError> {
-    let project = fetch_antigravity_project(base_url, token)?;
+    let project = match project_hint {
+        Some(project) => Some(project.to_string()),
+        None => fetch_antigravity_project(base_url, token)?,
+    };
     if let Some(project) = project.as_deref() {
         match fetch_antigravity_quota_summary(base_url, token, project) {
             Ok(data) => return Ok(data),
@@ -1460,17 +1795,6 @@ fn antigravity_usage_from_summary(
     (result.gemini.is_some() || result.claude.is_some() || result.argon.is_some()).then_some(result)
 }
 
-fn get_header_f64(response: &ureq::Response, name: &str) -> f64 {
-    response
-        .header(name)
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0)
-}
-
-fn get_header_i64(response: &ureq::Response, name: &str) -> Option<i64> {
-    response.header(name).and_then(|s| s.parse::<i64>().ok())
-}
-
 fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
     let secs = unix_secs?;
     if secs < 0 {
@@ -1482,7 +1806,25 @@ fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
 struct Credentials {
     access_token: String,
     expires_at: Option<i64>,
+    refresh_fingerprint: Option<u64>,
+    refresh_expires_at: Option<i64>,
     source: CredentialSource,
+}
+
+impl Credentials {
+    fn refresh_key(&self) -> ClaudeRefreshKey {
+        ClaudeRefreshKey {
+            refresh_fingerprint: self.refresh_fingerprint,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+/// In-memory fingerprint of a secret, for change detection only. Never logged.
+fn token_fingerprint(token: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    token.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Clone, Debug)]
@@ -1546,6 +1888,10 @@ fn codex_auth_path() -> Option<PathBuf> {
 }
 
 fn codex_credential_watch_signature() -> String {
+    // Watch the sign-in itself, not the file's size and mtime.
+    if let Some(creds) = read_codex_credentials() {
+        return format!("codex|signin|{:x}", creds.sign_in_fingerprint());
+    }
     credential_file_watch_signature("codex", codex_auth_path())
 }
 
@@ -1663,6 +2009,186 @@ fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
     }
 }
 
+/// Pick the access token for this poll: the stored one while it is valid, else
+/// a token refreshed in memory with the stored refresh token. Falls back to the
+/// stored token (and so to the existing sign-in prompt) when no refresh is
+/// possible.
+fn resolve_antigravity_access(creds: &AntigravityTokenData, now: SystemTime) -> AntigravityAccess {
+    let stored = || AntigravityAccess {
+        access_token: creds.access_token.clone(),
+        project: None,
+    };
+    let expiry = parse_iso8601(creds.expiry.as_deref());
+    if !antigravity_needs_refresh(expiry, now) {
+        return stored();
+    }
+    let Some(refresh_token) = creds.refresh_token.as_deref().filter(|t| !t.is_empty()) else {
+        return stored();
+    };
+    let refresh_fingerprint = token_fingerprint(refresh_token);
+    let client = load_antigravity_oauth_client(refresh_token);
+    let project = client.as_ref().and_then(|client| antigravity_project_hint(client, refresh_token));
+
+    if let Some(cached) = cached_antigravity_token(refresh_fingerprint, now) {
+        return AntigravityAccess {
+            access_token: cached,
+            project,
+        };
+    }
+    let Some(client) = client else {
+        diagnose::log("Antigravity token expired and no OAuth client file found; sign-in required");
+        return stored();
+    };
+    match refresh_antigravity_token(&client, refresh_token, now) {
+        Some((access_token, expires_at)) => {
+            if let Ok(mut cache) = ANTIGRAVITY_TOKEN_CACHE.lock() {
+                *cache = Some(CachedAccessToken {
+                    refresh_fingerprint,
+                    access_token: access_token.clone(),
+                    expires_at,
+                });
+            }
+            diagnose::log("Antigravity access token refreshed in memory");
+            AntigravityAccess {
+                access_token,
+                project,
+            }
+        }
+        None => stored(),
+    }
+}
+
+/// Refresh when the token is expired or within a minute of expiry. A token
+/// without a readable expiry is used as stored.
+fn antigravity_needs_refresh(expiry: Option<SystemTime>, now: SystemTime) -> bool {
+    match expiry {
+        Some(expiry) => now + ANTIGRAVITY_REFRESH_MARGIN >= expiry,
+        None => false,
+    }
+}
+
+fn cached_antigravity_token(refresh_fingerprint: u64, now: SystemTime) -> Option<String> {
+    let cache = ANTIGRAVITY_TOKEN_CACHE.lock().ok()?;
+    cache
+        .as_ref()
+        .filter(|cached| cached.refresh_fingerprint == refresh_fingerprint)
+        .filter(|cached| !antigravity_needs_refresh(Some(cached.expires_at), now))
+        .map(|cached| cached.access_token.clone())
+}
+
+/// The client file's project belongs to the account it was issued for; use it
+/// only when that is the same sign-in as `agy`'s.
+fn antigravity_project_hint(client: &AntigravityOAuthClient, refresh_token: &str) -> Option<String> {
+    (client.refresh_token.as_deref() == Some(refresh_token))
+        .then(|| client.project_id.clone())
+        .flatten()
+        .filter(|project| !project.is_empty())
+}
+
+fn refresh_antigravity_token(
+    client: &AntigravityOAuthClient,
+    refresh_token: &str,
+    now: SystemTime,
+) -> Option<(String, SystemTime)> {
+    let agent = build_agent().ok()?;
+    let token_uri = client
+        .token_uri
+        .as_deref()
+        .filter(|uri| uri.starts_with("https://"))
+        .unwrap_or(ANTIGRAVITY_DEFAULT_TOKEN_URI);
+    let response = agent.post(token_uri).send_form(&[
+        ("client_id", client.client_id.as_str()),
+        ("client_secret", client.client_secret.as_str()),
+        ("refresh_token", refresh_token),
+        ("grant_type", "refresh_token"),
+    ]);
+    let body = match response {
+        Ok(response) => response.into_string().ok()?,
+        Err(ureq::Error::Status(code, _)) => {
+            diagnose::log(format!("Antigravity token refresh returned status {code}"));
+            return None;
+        }
+        Err(error) => {
+            diagnose::log_error("Antigravity token refresh request failed", error);
+            return None;
+        }
+    };
+    let parsed = parse_google_token_response(&body, now);
+    if parsed.is_none() {
+        diagnose::log("unable to parse Antigravity token refresh response");
+    }
+    parsed
+}
+
+fn parse_google_token_response(body: &str, now: SystemTime) -> Option<(String, SystemTime)> {
+    let response: GoogleTokenResponse = serde_json::from_str(body).ok()?;
+    if response.access_token.is_empty() {
+        return None;
+    }
+    // Google access tokens last an hour; assume that if the field is missing.
+    let lifetime = Duration::from_secs(response.expires_in.unwrap_or(3600));
+    Some((response.access_token, now + lifetime))
+}
+
+/// Client file sources, in order: the env var, `antigravity_oauth_client_file`
+/// in settings.json, then T3 Code's per-account `acp_token.json` files.
+fn load_antigravity_oauth_client(refresh_token: &str) -> Option<AntigravityOAuthClient> {
+    let explicit = std::env::var_os(ANTIGRAVITY_CLIENT_FILE_ENV)
+        .map(PathBuf::from)
+        .or_else(antigravity_client_file_from_settings);
+    if let Some(path) = explicit {
+        return read_antigravity_oauth_client(&path);
+    }
+
+    let pattern_root = dirs::home_dir()?
+        .join(".t3")
+        .join("userdata")
+        .join("providers")
+        .join("antigravity");
+    let candidates = std::fs::read_dir(pattern_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path().join("antigravity-acp").join("acp_token.json");
+            let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+            Some((modified, read_antigravity_oauth_client(&path)?))
+        })
+        .collect();
+    select_antigravity_oauth_client(candidates, refresh_token)
+}
+
+fn antigravity_client_file_from_settings() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("APPDATA")?)
+        .join("ClaudeCodeUsageMonitor")
+        .join("settings.json");
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    settings
+        .get("antigravity_oauth_client_file")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn read_antigravity_oauth_client(path: &PathBuf) -> Option<AntigravityOAuthClient> {
+    let client: AntigravityOAuthClient =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    (!client.client_id.is_empty() && !client.client_secret.is_empty()).then_some(client)
+}
+
+/// Prefer the file issued for the same sign-in as `agy`, else the newest one.
+fn select_antigravity_oauth_client(
+    mut candidates: Vec<(SystemTime, AntigravityOAuthClient)>,
+    refresh_token: &str,
+) -> Option<AntigravityOAuthClient> {
+    candidates.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    let matching = candidates
+        .iter()
+        .position(|(_, client)| client.refresh_token.as_deref() == Some(refresh_token));
+    let index = matching.unwrap_or(0);
+    (index < candidates.len()).then(|| candidates.swap_remove(index).1)
+}
+
 fn read_windows_generic_credential(target: &str) -> Option<String> {
     const CRED_TYPE_GENERIC: u32 = 1;
 
@@ -1742,10 +2268,18 @@ fn parse_credentials(content: &str, source: CredentialSource) -> Option<Credenti
         .and_then(|v| v.as_str())?
         .to_string();
     let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64());
+    let refresh_fingerprint = oauth
+        .get("refreshToken")
+        .and_then(|v| v.as_str())
+        .filter(|token| !token.is_empty())
+        .map(token_fingerprint);
+    let refresh_expires_at = oauth.get("refreshTokenExpiresAt").and_then(|v| v.as_i64());
 
     Some(Credentials {
         access_token,
         expires_at,
+        refresh_fingerprint,
+        refresh_expires_at,
         source,
     })
 }
@@ -1859,7 +2393,7 @@ fn is_token_expired(expires_at: Option<i64>) -> bool {
 }
 
 /// Parse an ISO 8601 timestamp string into a SystemTime.
-fn parse_iso8601(s: Option<&str>) -> Option<SystemTime> {
+pub(crate) fn parse_iso8601(s: Option<&str>) -> Option<SystemTime> {
     let s = s?;
     if s.len() < 10 || !s.is_char_boundary(10) {
         return None;
@@ -2041,9 +2575,258 @@ pub fn app_is_past_reset(data: &AppUsageData) -> bool {
         || data.cursor.as_ref().is_some_and(is_past_reset)
 }
 
+/// Live usage for a read-only manual check: no token refresh, no CLI calls.
+/// A provider whose stored token is expired or rejected is left empty.
+#[cfg(test)]
+pub(crate) fn read_only_live_usage() -> AppUsageData {
+    let mut data = AppUsageData::default();
+    if let Some(creds) = read_first_credentials().filter(|c| !is_token_expired(c.expires_at)) {
+        data.claude_code = fetch_usage_with_fallback(&creds.access_token).ok();
+    }
+    if let Some(creds) = read_codex_credentials() {
+        data.codex = fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()).ok();
+    }
+    data
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NOW: i64 = 1_800_000_000_000;
+
+    fn refresh_key(fingerprint: u64, expires_at: i64) -> ClaudeRefreshKey {
+        ClaudeRefreshKey {
+            refresh_fingerprint: Some(fingerprint),
+            expires_at: Some(expires_at),
+        }
+    }
+
+    fn antigravity_client(refresh: Option<&str>, project: Option<&str>) -> AntigravityOAuthClient {
+        AntigravityOAuthClient {
+            client_id: "fixture-client".into(),
+            client_secret: "fixture-secret".into(),
+            token_uri: None,
+            refresh_token: refresh.map(Into::into),
+            project_id: project.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn antigravity_refresh_decision_uses_sixty_second_margin() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert!(!antigravity_needs_refresh(Some(now + Duration::from_secs(61)), now));
+        assert!(antigravity_needs_refresh(Some(now + Duration::from_secs(60)), now));
+        assert!(antigravity_needs_refresh(Some(now - Duration::from_secs(1)), now));
+        assert!(!antigravity_needs_refresh(None, now));
+    }
+
+    #[test]
+    fn antigravity_agy_expiry_with_offset_and_long_fraction_parses() {
+        let expiry = parse_iso8601(Some("2026-11-22T00:39:44.9530961+05:45")).unwrap();
+        let utc = parse_iso8601(Some("2026-11-21T18:54:44Z")).unwrap();
+        assert_eq!(expiry, utc);
+    }
+
+    #[test]
+    fn antigravity_credential_fixture_keeps_refresh_fields() {
+        let auth: AntigravityAuthFile = serde_json::from_str(
+            r#"{"token":{"access_token":"a","token_type":"Bearer","refresh_token":"r","expiry":"2026-11-22T00:39:44.9530961+05:45","expires_in":3599},"auth_method":"oauth-personal","id_token_email":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(auth.token.refresh_token.as_deref(), Some("r"));
+        assert!(parse_iso8601(auth.token.expiry.as_deref()).is_some());
+    }
+
+    #[test]
+    fn google_token_response_parses_and_rejects_errors() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let (token, expires) =
+            parse_google_token_response(r#"{"access_token":"new","expires_in":3599,"token_type":"Bearer"}"#, now)
+                .unwrap();
+        assert_eq!(token, "new");
+        assert_eq!(expires, now + Duration::from_secs(3599));
+        assert!(parse_google_token_response(r#"{"error":"invalid_grant"}"#, now).is_none());
+        assert!(parse_google_token_response(r#"{"access_token":""}"#, now).is_none());
+    }
+
+    #[test]
+    fn antigravity_client_prefers_same_sign_in_then_newest() {
+        let t = |secs| UNIX_EPOCH + Duration::from_secs(secs);
+        let picked = select_antigravity_oauth_client(
+            vec![
+                (t(30), antigravity_client(Some("other"), Some("p-new"))),
+                (t(10), antigravity_client(Some("mine"), Some("p-mine"))),
+            ],
+            "mine",
+        )
+        .unwrap();
+        assert_eq!(picked.project_id.as_deref(), Some("p-mine"));
+
+        let newest = select_antigravity_oauth_client(
+            vec![
+                (t(10), antigravity_client(Some("a"), Some("p-old"))),
+                (t(30), antigravity_client(Some("b"), Some("p-new"))),
+            ],
+            "mine",
+        )
+        .unwrap();
+        assert_eq!(newest.project_id.as_deref(), Some("p-new"));
+        assert!(select_antigravity_oauth_client(Vec::new(), "mine").is_none());
+    }
+
+    #[test]
+    fn antigravity_project_hint_only_for_same_sign_in() {
+        assert_eq!(
+            antigravity_project_hint(&antigravity_client(Some("mine"), Some("p1")), "mine").as_deref(),
+            Some("p1")
+        );
+        assert!(antigravity_project_hint(&antigravity_client(Some("other"), Some("p1")), "mine").is_none());
+        assert!(antigravity_project_hint(&antigravity_client(Some("mine"), Some("")), "mine").is_none());
+    }
+
+    #[test]
+    fn antigravity_valid_token_is_used_without_refresh() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let creds = AntigravityTokenData {
+            access_token: "stored".into(),
+            refresh_token: Some("r".into()),
+            expiry: Some("2027-01-16T08:00:00Z".into()),
+        };
+        let access = resolve_antigravity_access(&creds, now);
+        assert_eq!(access.access_token, "stored");
+        assert!(access.project.is_none());
+    }
+
+    #[test]
+    fn grok_expired_sign_in_is_renewable_and_fingerprint_tracks_it() {
+        let parse = |json: &str| serde_json::from_str::<BTreeMap<String, GrokAuthEntry>>(json).unwrap();
+        let expired = parse(r#"{"https://auth.x.ai::u":{"key":"k","auth_mode":"oidc","user_id":"u","refresh_token":"rt-1","oidc_issuer":"https://auth.x.ai","expires_at":"2020-01-01T00:00:00Z"}}"#);
+        let rotated = parse(r#"{"https://auth.x.ai::u":{"key":"k","auth_mode":"oidc","user_id":"u","refresh_token":"rt-2","oidc_issuer":"https://auth.x.ai","expires_at":"2020-01-01T00:00:00Z"}}"#);
+        let api_key = parse(r#"{"x":{"key":"k","auth_mode":"api_key","user_id":"u"}}"#);
+        let a = grok_expired_sign_in_fingerprint(&expired).unwrap();
+        assert_eq!(Some(a), grok_expired_sign_in_fingerprint(&expired));
+        assert_ne!(Some(a), grok_expired_sign_in_fingerprint(&rotated));
+        assert_eq!(grok_expired_sign_in_fingerprint(&api_key), None);
+        assert!(select_grok_credentials(expired).is_none());
+    }
+
+    #[test]
+    fn codex_breaker_waits_for_a_new_sign_in() {
+        assert!(codex_refresh_allowed(None, 7));
+        assert!(!codex_refresh_allowed(Some(7), 7));
+        assert!(codex_refresh_allowed(Some(7), 8));
+        let token = |access: &str, refresh: Option<&str>| CodexTokenData {
+            access_token: access.into(),
+            account_id: None,
+            refresh_token: refresh.map(Into::into),
+        };
+        let a = token("a", Some("r")).sign_in_fingerprint();
+        assert_eq!(a, token("a", Some("r")).sign_in_fingerprint());
+        assert_ne!(a, token("b", Some("r")).sign_in_fingerprint());
+        assert_ne!(a, token("a", Some("r2")).sign_in_fingerprint());
+    }
+
+    /// Live, read-only: starts `codex app-server` and reads rate limits.
+    #[test]
+    #[ignore]
+    fn codex_app_server_live_read() {
+        let started = std::time::Instant::now();
+        let usage = codex_app_server_rate_limits().expect("rate limits");
+        println!(
+            "session {}% weekly {}% in {:?}",
+            usage.session.percentage, usage.weekly.percentage, started.elapsed()
+        );
+    }
+
+    #[test]
+    fn codex_app_server_rate_limits_map_by_window_length() {
+        let reply = r#"{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":87,"windowDurationMins":10080,"resetsAt":1795540551},"secondary":null,"planType":"prolite"},"rateLimitsByLimitId":{"codex":{"limitId":"codex","primary":{"usedPercent":87,"windowDurationMins":10080,"resetsAt":1795540551},"secondary":null}}}}"#;
+        let usage = codex_usage_from_app_server_line(reply).unwrap().unwrap();
+        assert_eq!(usage.weekly.percentage, 87.0);
+        assert!(usage.weekly.resets_at.is_some());
+        assert!(usage.session.resets_at.is_none());
+
+        let both = r#"{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":12,"windowDurationMins":300,"resetsAt":1795540551},"secondary":{"usedPercent":40,"windowDurationMins":10080,"resetsAt":1795540999}}}}"#;
+        let usage = codex_usage_from_app_server_line(both).unwrap().unwrap();
+        assert_eq!((usage.session.percentage, usage.weekly.percentage), (12.0, 40.0));
+
+        assert_eq!(
+            codex_usage_from_app_server_line(r#"{"id":2,"error":{"code":-32000,"message":"auth"}}"#)
+                .map(|answer| answer.is_none()),
+            Some(true)
+        );
+        assert!(codex_usage_from_app_server_line(r#"{"id":1,"result":{}}"#).is_none());
+        assert!(codex_usage_from_app_server_line("not json").is_none());
+    }
+
+    #[test]
+    fn claude_refresh_breaker_attempts_first_refresh() {
+        let current = refresh_key(1, NOW - 1_000);
+        assert_eq!(
+            claude_refresh_decision(None, current, Some(NOW + 86_400_000), NOW),
+            ClaudeRefreshDecision::Attempt
+        );
+    }
+
+    #[test]
+    fn claude_refresh_breaker_skips_unchanged_sign_in_after_failure() {
+        let current = refresh_key(1, NOW - 1_000);
+        assert_eq!(
+            claude_refresh_decision(Some(current), current, None, NOW),
+            ClaudeRefreshDecision::SkipAfterFailedAttempt
+        );
+    }
+
+    #[test]
+    fn claude_refresh_breaker_rearms_on_new_refresh_token_or_expiry() {
+        let failed = refresh_key(1, NOW - 1_000);
+        assert_eq!(
+            claude_refresh_decision(Some(failed), refresh_key(2, NOW - 1_000), None, NOW),
+            ClaudeRefreshDecision::Attempt
+        );
+        assert_eq!(
+            claude_refresh_decision(Some(failed), refresh_key(1, NOW - 500), None, NOW),
+            ClaudeRefreshDecision::Attempt
+        );
+    }
+
+    #[test]
+    fn claude_refresh_breaker_skips_expired_refresh_token() {
+        assert_eq!(
+            claude_refresh_decision(None, refresh_key(1, NOW - 1_000), Some(NOW - 1), NOW),
+            ClaudeRefreshDecision::SkipRefreshTokenExpired
+        );
+    }
+
+    #[test]
+    fn claude_sign_in_signature_ignores_mcp_entries_and_hides_tokens() {
+        let base = r#"{"claudeAiOauth":{"accessToken":"secret-access","refreshToken":"secret-refresh","expiresAt":1800000000000,"refreshTokenExpiresAt":1900000000000},"mcpOAuth":{"x":{"accessToken":"a"}}}"#;
+        let changed_mcp = r#"{"claudeAiOauth":{"accessToken":"secret-access","refreshToken":"secret-refresh","expiresAt":1800000000000,"refreshTokenExpiresAt":1900000000000},"mcpOAuth":{"x":{"accessToken":"bbbbbbbb"}}}"#;
+        let new_sign_in = r#"{"claudeAiOauth":{"accessToken":"secret-access-2","refreshToken":"secret-refresh-2","expiresAt":1800000999000}}"#;
+        let source = || CredentialSource::Windows(PathBuf::from("c"));
+        let sig = |content: &str| {
+            claude_sign_in_signature("win:c", parse_credentials(content, source()).unwrap().refresh_key())
+        };
+
+        assert_eq!(sig(base), sig(changed_mcp));
+        assert_ne!(sig(base), sig(new_sign_in));
+        assert!(!sig(base).contains("secret"));
+        let creds = parse_credentials(base, source()).unwrap();
+        assert_eq!(creds.refresh_expires_at, Some(1_900_000_000_000));
+    }
+
+    #[test]
+    fn claude_refresh_never_runs_a_full_default_session() {
+        assert_eq!(ClaudeRefreshMode::AuthStatus.cli_args(), &["auth", "status", "--json"]);
+        let script = wsl_refresh_script(ClaudeRefreshMode::AuthStatus);
+        assert!(script.contains("cd \"$d\""));
+        assert!(script.ends_with("auth status --json"));
+        assert!(!claude_refresh_working_dir()
+            .to_string_lossy()
+            .to_lowercase()
+            .contains("system32"));
+    }
 
     fn usage_with_session_percent(percentage: f64) -> UsageData {
         UsageData {
