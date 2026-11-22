@@ -16,6 +16,7 @@ use crate::localization::Strings;
 use crate::models::{AntigravityUsage, AppUsageData, UsageData, UsageSection};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const CLAUDE_USAGE_USER_AGENT: &str = "claude-code/2.1.327";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const CURSOR_USAGE_URL: &str =
@@ -1238,6 +1239,8 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
         .get(USAGE_URL)
         .set("Authorization", &format!("Bearer {token}"))
         .set("anthropic-beta", "oauth-2025-04-20")
+        // Without a Claude Code user agent this endpoint answers 429.
+        .set("User-Agent", CLAUDE_USAGE_USER_AGENT)
         .call()
     {
         Ok(resp) => resp,
@@ -1247,7 +1250,14 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
             ));
             return Err(PollError::AuthRequired);
         }
-        Err(_) => return Ok(None),
+        Err(ureq::Error::Status(code, _)) => {
+            diagnose::log(format!("usage endpoint returned status {code}"));
+            return Ok(None);
+        }
+        Err(error) => {
+            diagnose::log_error("usage endpoint request failed", error);
+            return Ok(None);
+        }
     };
 
     let response: UsageResponse = match resp.into_json() {
