@@ -16,7 +16,6 @@ use crate::localization::Strings;
 use crate::models::{AntigravityUsage, AppUsageData, UsageData, UsageSection};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const GROK_BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 const CURSOR_USAGE_URL: &str =
@@ -31,7 +30,6 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const PROVIDER_CLIENT_VERSION: &str =
     concat!("claude-code-usage-monitor/", env!("CARGO_PKG_VERSION"));
 
-const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-3-haiku-20240307", "claude-haiku-4-5-20251001"];
 static CURSOR_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Credential state seen right after a CLI refresh that left the token expired,
 /// per credential source. While the stored refresh token and expiry stay the
@@ -648,14 +646,13 @@ fn unix_now_millis() -> i64 {
 /// credentials, or the refresh key read after the failed attempt (if readable).
 ///
 /// `claude auth status` refreshes an expired OAuth token without a model call
-/// and without saving a session. A CLI that does not refresh there gets one
-/// minimal print-mode request with session saving, MCP servers, user settings
-/// (and so user hooks) and tools turned off.
+/// and without saving a session. Nothing here ever sends a model request: if
+/// that does not refresh the token, the widget asks for a new sign-in.
 fn refresh_claude_source(
     source: &CredentialSource,
 ) -> Result<Credentials, Option<ClaudeRefreshKey>> {
     let mut after = None;
-    for mode in [ClaudeRefreshMode::AuthStatus, ClaudeRefreshMode::MinimalPrompt] {
+    for mode in [ClaudeRefreshMode::AuthStatus] {
         cli_refresh_token(source, mode);
         match read_credentials_from_source(source) {
             Some(refreshed) if !is_token_expired(refreshed.expires_at) => return Ok(refreshed),
@@ -676,34 +673,18 @@ fn refresh_claude_source(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClaudeRefreshMode {
     AuthStatus,
-    MinimalPrompt,
 }
 
 impl ClaudeRefreshMode {
     fn cli_args(self) -> &'static [&'static str] {
         match self {
             Self::AuthStatus => &["auth", "status", "--json"],
-            Self::MinimalPrompt => &[
-                "-p",
-                ".",
-                "--model",
-                "haiku",
-                "--no-session-persistence",
-                "--strict-mcp-config",
-                "--setting-sources",
-                "project",
-                "--tools",
-                "",
-            ],
         }
     }
 
     fn shell_args(self) -> &'static str {
         match self {
             Self::AuthStatus => "auth status --json",
-            Self::MinimalPrompt => {
-                "-p . --model haiku --no-session-persistence --strict-mcp-config --setting-sources project --tools ''"
-            }
         }
     }
 }
@@ -1171,33 +1152,15 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
 }
 
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
-    // Try the dedicated usage endpoint first
+    // Only the usage endpoint: the old Messages API fallback sent a real
+    // model request just to read rate-limit headers, which spends usage.
     match try_usage_endpoint(token)? {
-        Some(data) => {
-            // If reset timers are missing, fill them in from the Messages API
-            if data.session.resets_at.is_none() || data.weekly.resets_at.is_none() {
-                if let Ok(fallback) = fetch_usage_via_messages(token) {
-                    let mut merged = data;
-                    if merged.session.resets_at.is_none() {
-                        merged.session.resets_at = fallback.session.resets_at;
-                    }
-                    if merged.weekly.resets_at.is_none() {
-                        merged.weekly.resets_at = fallback.weekly.resets_at;
-                    }
-                    return Ok(merged);
-                }
-            }
-            return Ok(data);
+        Some(data) => Ok(data),
+        None => {
+            diagnose::log("usage endpoint returned no usage data");
+            Err(PollError::RequestFailed)
         }
-        None => {}
     }
-
-    // Fall back to Messages API with rate limit headers
-    let result = fetch_usage_via_messages(token);
-    if result.is_err() {
-        diagnose::log("usage endpoint and Messages API fallback both failed");
-    }
-    result
 }
 
 fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
@@ -1236,84 +1199,6 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
     }
 
     Ok(Some(data))
-}
-
-fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
-    let agent = build_agent()?;
-
-    for model in MODEL_FALLBACK_CHAIN {
-        let body = serde_json::json!({
-            "model": model,
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "."}]
-        });
-
-        let response = match agent
-            .post(MESSAGES_URL)
-            .set("Authorization", &format!("Bearer {token}"))
-            .set("anthropic-version", "2023-06-01")
-            .set("anthropic-beta", "oauth-2025-04-20")
-            .send_json(&body)
-        {
-            Ok(resp) => resp,
-            Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-                diagnose::log(format!(
-                    "messages endpoint returned auth error status {code}; re-login required"
-                ));
-                return Err(PollError::AuthRequired);
-            }
-            Err(ureq::Error::Status(_code, resp)) => resp,
-            Err(_) => continue,
-        };
-
-        let h5 = response.header("anthropic-ratelimit-unified-5h-utilization");
-        let h7 = response.header("anthropic-ratelimit-unified-7d-utilization");
-        let hs = response.header("anthropic-ratelimit-unified-status");
-
-        if h5.is_some() || h7.is_some() || hs.is_some() {
-            return Ok(parse_rate_limit_headers(&response));
-        }
-    }
-
-    Err(PollError::RequestFailed)
-}
-
-fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
-    let mut data = UsageData::default();
-
-    data.session.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization") * 100.0;
-    data.session.resets_at = unix_to_system_time(get_header_i64(
-        response,
-        "anthropic-ratelimit-unified-5h-reset",
-    ));
-
-    data.weekly.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization") * 100.0;
-    data.weekly.resets_at = unix_to_system_time(get_header_i64(
-        response,
-        "anthropic-ratelimit-unified-7d-reset",
-    ));
-
-    let overall_reset = get_header_i64(response, "anthropic-ratelimit-unified-reset");
-
-    if data.session.percentage == 0.0 && data.weekly.percentage == 0.0 {
-        let status = response.header("anthropic-ratelimit-unified-status");
-        if status == Some("rejected") {
-            let claim = response.header("anthropic-ratelimit-unified-representative-claim");
-            match claim {
-                Some("five_hour") => data.session.percentage = 100.0,
-                Some("seven_day") => data.weekly.percentage = 100.0,
-                _ => {}
-            }
-        }
-
-        if data.session.resets_at.is_none() && overall_reset.is_some() {
-            data.session.resets_at = unix_to_system_time(overall_reset);
-        }
-    }
-
-    data
 }
 
 fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData, PollError> {
@@ -1830,17 +1715,6 @@ fn antigravity_usage_from_summary(
         }
     }
     (result.gemini.is_some() || result.claude.is_some() || result.argon.is_some()).then_some(result)
-}
-
-fn get_header_f64(response: &ureq::Response, name: &str) -> f64 {
-    response
-        .header(name)
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0)
-}
-
-fn get_header_i64(response: &ureq::Response, name: &str) -> Option<i64> {
-    response.header(name).and_then(|s| s.parse::<i64>().ok())
 }
 
 fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
@@ -2854,10 +2728,6 @@ mod tests {
     #[test]
     fn claude_refresh_never_runs_a_full_default_session() {
         assert_eq!(ClaudeRefreshMode::AuthStatus.cli_args(), &["auth", "status", "--json"]);
-        let prompt = ClaudeRefreshMode::MinimalPrompt.cli_args();
-        for flag in ["--no-session-persistence", "--strict-mcp-config", "--model"] {
-            assert!(prompt.contains(&flag), "missing {flag}");
-        }
         let script = wsl_refresh_script(ClaudeRefreshMode::AuthStatus);
         assert!(script.contains("cd \"$d\""));
         assert!(script.ends_with("auth status --json"));
