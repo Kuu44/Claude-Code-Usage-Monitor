@@ -2083,7 +2083,7 @@ fn select_antigravity_oauth_client(
     mut candidates: Vec<(SystemTime, AntigravityOAuthClient)>,
     refresh_token: &str,
 ) -> Option<AntigravityOAuthClient> {
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     let matching = candidates
         .iter()
         .position(|(_, client)| client.refresh_token.as_deref() == Some(refresh_token));

@@ -2624,10 +2624,7 @@ fn hover_column_at(
     if client_x < column_x {
         return None;
     }
-    for i in 0..7 {
-        if !enabled[i] {
-            continue;
-        }
+    for (i, _) in enabled.iter().enumerate().filter(|(_, on)| **on) {
         let graphic = layout.graphics[i];
         let visual_width = if graphic == crate::widget_layout::Graphic::None {
             0
