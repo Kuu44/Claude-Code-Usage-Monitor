@@ -247,3 +247,5 @@ If the newer usage endpoint is unavailable, it can fall back to reading the rate
 This project is licensed under MIT.
 
 If you want to inspect the behavior or audit the code, everything is in this repository.
+
+Contributors changing strings or taskbar positioning: see [docs/agent-notes.md](docs/agent-notes.md).
